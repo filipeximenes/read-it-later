@@ -49,6 +49,8 @@ def save_article(
         description=extracted.description,
         published_date=extracted.published_date,
         tags=extracted.tags,
+        image_urls=extracted.image_urls,
+        video_urls=extracted.video_urls,
         saved_at=now,
         read=read,
         read_at=now if read else None,
@@ -115,6 +117,14 @@ def _write_markdown_file(
     if article.tags:
         tags_str = ", ".join(article.tags)
         front_matter_lines.append(f"tags: [{tags_str}]")
+    if article.image_urls:
+        front_matter_lines.append("images:")
+        for img_url in article.image_urls:
+            front_matter_lines.append(f"  - {img_url}")
+    if article.video_urls:
+        front_matter_lines.append("videos:")
+        for vid_url in article.video_urls:
+            front_matter_lines.append(f"  - {vid_url}")
     if article.fetch_failed:
         front_matter_lines.append("fetch_failed: true")
     front_matter_lines.append("---")

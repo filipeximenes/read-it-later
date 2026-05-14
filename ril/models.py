@@ -14,6 +14,8 @@ class Article(BaseModel):
     description: Optional[str] = None
     published_date: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
+    image_urls: list[str] = Field(default_factory=list)
+    video_urls: list[str] = Field(default_factory=list)
     saved_at: datetime
     read: bool = False
     read_at: Optional[datetime] = None
