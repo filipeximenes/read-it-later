@@ -1,0 +1,2 @@
+[console_scripts]
+ril = ril.cli:app
