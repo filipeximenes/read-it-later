@@ -298,9 +298,13 @@ async function openArticle(id) {
 
   const res = await fetch(`/api/articles/${id}/content`);
   const data = await res.json();
-  document.getElementById('article-body').innerHTML = marked.parse(data.content);
+  document.getElementById('article-body').innerHTML = injectInlineVideos(marked.parse(data.content));
 
-  renderVideos(article);
+  // Show the fallback Videos section only when the body has no inline embeds
+  // (i.e. articles saved before inline-marker extraction was added).
+  if (!document.querySelector('#article-body .video-wrapper')) {
+    renderVideos(article);
+  }
 }
 
 function renderArticleHeader(article) {
@@ -320,6 +324,22 @@ function renderArticleHeader(article) {
     btn.textContent = '✓ Mark as read';
     btn.classList.remove('is-read');
   }
+}
+
+function injectInlineVideos(html) {
+  // Replace <p>video-embed:URL</p> markers (inserted by the extractor) with
+  // real iframe embeds. Handles two marked.js rendering variants:
+  //   Plain:      <p>video-embed:https://...</p>
+  //   GFM linked: <p>video-embed:<a href="https://...">https://...</a></p>
+  // Extra \s* guards against any whitespace marked may insert around the content.
+  return html.replace(
+    /<p>\s*video-embed:\s*(?:<a[^>]*href="([^"]+)"[^>]*>[^<]*<\/a>|([^<\s]+))\s*<\/p>/gi,
+    (_, hrefUrl, textUrl) => {
+      const embedUrl = toEmbedUrl(hrefUrl || textUrl);
+      if (!embedUrl) return '';
+      return `<div class="video-wrapper"><iframe src="${embedUrl}" allowfullscreen allow="autoplay; encrypted-media"></iframe></div>`;
+    }
+  );
 }
 
 function renderVideos(article) {

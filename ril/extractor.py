@@ -18,6 +18,16 @@ _VIDEO_PROVIDERS = re.compile(
 
 _MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((https?://[^\s)]+)\)")
 
+# Matches a <figure class="*embed*"> block that wraps a video <iframe>.
+# Used to replace the whole block with an inline text marker before trafilatura runs,
+# because trafilatura treats embed figures as non-content and strips them entirely.
+_EMBED_FIGURE_RE = re.compile(
+    r'<figure[^>]*class="[^"]*(?:wp-block-embed|embed)[^"]*"[^>]*>'
+    r'.*?<iframe[^>]*\bsrc="([^"]*)"[^>]*>'
+    r'.*?</figure>',
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 @dataclass
 class ExtractedArticle:
@@ -191,7 +201,10 @@ class _VideoEmbedPreprocessor(HTMLParser):
         src = attr_dict.get("src") or ""
         if tag == "iframe" and src and _VIDEO_PROVIDERS.search(src):
             absolute = urljoin(self.base_url, src)
-            self._parts.append(f'<p><a href="{absolute}">Video</a></p>')
+            # A plain paragraph with a distinctive marker keeps position in
+            # the trafilatura-extracted markdown (unlike <a> or <img> inside
+            # embed figures, which trafilatura strips as non-content).
+            self._parts.append(f"<p>video-embed:{absolute}</p>")
         else:
             attr_str = "".join(
                 f' {k}="{v}"' if v is not None else f" {k}" for k, v in attrs
@@ -218,6 +231,19 @@ class _VideoEmbedPreprocessor(HTMLParser):
 
 
 def _preprocess_video_embeds(html: str, base_url: str) -> str:
+    # Replace <figure class="*embed*">...<iframe src="URL">...</figure> blocks first.
+    # Trafilatura treats those figures as embed non-content and strips them entirely,
+    # so we must hoist the video marker out to a plain <p> before trafilatura sees it.
+    def _replace_embed_figure(m: re.Match) -> str:
+        src = m.group(1)
+        if _VIDEO_PROVIDERS.search(src):
+            absolute = urljoin(base_url, src)
+            return f"<p>video-embed:{absolute}</p>"
+        return m.group(0)
+
+    html = _EMBED_FIGURE_RE.sub(_replace_embed_figure, html)
+
+    # Handle any remaining standalone video iframes (not wrapped in embed figures).
     preprocessor = _VideoEmbedPreprocessor(base_url)
     preprocessor.feed(html)
     return preprocessor.get_output()
