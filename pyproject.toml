@@ -5,6 +5,7 @@ description = "A CLI tool to save, store and read articles later"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
     "markdownify>=1.2.2",
     "pydantic>=2.13.4",
@@ -12,6 +13,7 @@ dependencies = [
     "rich>=15.0.0",
     "trafilatura>=2.0.0",
     "typer>=0.25.1",
+    "uvicorn>=0.34.0",
 ]
 
 [project.scripts]

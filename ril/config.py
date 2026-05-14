@@ -21,8 +21,25 @@ def load_config() -> Optional[dict]:
 
 def save_config(data_folder: Path) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    existing = load_config() or {}
+    existing["data_folder"] = str(data_folder)
     with CONFIG_FILE.open("w") as f:
-        json.dump({"data_folder": str(data_folder)}, f, indent=2)
+        json.dump(existing, f, indent=2)
+
+
+def get_backup_folder() -> Optional[Path]:
+    config = load_config()
+    if config and "backup_folder" in config:
+        return Path(config["backup_folder"])
+    return None
+
+
+def save_backup_folder(folder: Path) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    existing = load_config() or {}
+    existing["backup_folder"] = str(folder)
+    with CONFIG_FILE.open("w") as f:
+        json.dump(existing, f, indent=2)
 
 
 def get_data_folder() -> Path:

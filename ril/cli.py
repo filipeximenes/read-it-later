@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import zipfile
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich import box
@@ -10,7 +13,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
-from ril.config import get_data_folder
+from ril.config import get_backup_folder, get_data_folder, save_backup_folder
 from ril.extractor import fetch_and_extract
 from ril.models import Article
 from ril.storage import (
@@ -212,6 +215,73 @@ def delete(
 
     delete_article(data_folder, article)
     console.print(f"[red]Deleted:[/red] {article.title}")
+
+
+# ---------------------------------------------------------------------------
+# backup
+# ---------------------------------------------------------------------------
+
+@app.command()
+def backup(
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Directory to save the backup file"),
+):
+    """Compress all data into a timestamped .zip backup file."""
+    data_folder = _data_folder()
+
+    destination = output
+    if destination is None:
+        destination = get_backup_folder()
+
+    if destination is None:
+        default_dest = Path.home() / "Desktop"
+        raw = typer.prompt(
+            "Where should backups be saved?",
+            default=str(default_dest),
+        )
+        destination = Path(raw).expanduser().resolve()
+        save_backup_folder(destination)
+        console.print(f"[dim]Backup location saved to config.[/dim]")
+
+    destination = Path(destination).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    zip_path = destination / f"ril-backup-{timestamp}.zip"
+
+    with console.status("[bold cyan]Creating backup…[/bold cyan]"):
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file in sorted(data_folder.rglob("*")):
+                if file.is_file():
+                    zf.write(file, file.relative_to(data_folder))
+
+    console.print(f"[bold green]Backup saved:[/bold green] {zip_path}")
+
+
+# ---------------------------------------------------------------------------
+# serve
+# ---------------------------------------------------------------------------
+
+@app.command()
+def serve(
+    port: int = typer.Option(8484, "--port", "-p", help="Port to listen on"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Don't open browser automatically"),
+):
+    """Start a local web server and open the reader UI in your browser."""
+    import threading
+    import webbrowser
+
+    import uvicorn
+
+    from ril.server import build_app
+
+    data_folder = _data_folder()
+    fastapi_app = build_app(data_folder)
+
+    if not no_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
+
+    console.print(f"[bold cyan]Starting server at[/bold cyan] http://localhost:{port}  [dim](Ctrl+C to stop)[/dim]")
+    uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="warning")
 
 
 if __name__ == "__main__":
