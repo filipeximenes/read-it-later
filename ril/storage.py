@@ -35,10 +35,16 @@ def save_article(
     data_folder: Path,
     extracted: ExtractedArticle,
     read: bool = False,
+    saved_at: Optional[datetime] = None,
 ) -> Article:
-    now = datetime.now(timezone.utc)
+    effective_saved_at = saved_at if saved_at is not None else datetime.now(timezone.utc)
+    if effective_saved_at.tzinfo is None:
+        effective_saved_at = effective_saved_at.replace(tzinfo=timezone.utc)
+    else:
+        effective_saved_at = effective_saved_at.astimezone(timezone.utc)
+
     article_id = compute_id(extracted.url)
-    filename = _build_filename(now, article_id, extracted.title)
+    filename = _build_filename(effective_saved_at, article_id, extracted.title)
     article_file = data_folder / "articles" / filename
 
     article = Article(
@@ -51,9 +57,9 @@ def save_article(
         tags=extracted.tags,
         image_urls=extracted.image_urls,
         video_urls=extracted.video_urls,
-        saved_at=now,
+        saved_at=effective_saved_at,
         read=read,
-        read_at=now if read else None,
+        read_at=effective_saved_at if read else None,
         filename=filename,
         fetch_failed=extracted.fetch_failed,
     )

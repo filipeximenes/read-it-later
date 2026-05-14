@@ -10,9 +10,11 @@ from typing import Optional
 import typer
 from rich import box
 from rich.console import Console
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.table import Table
 from rich.text import Text
 
+from ril import pocket
 from ril.config import get_backup_folder, get_data_folder, save_backup_folder
 from ril.extractor import fetch_and_extract
 from ril.models import Article
@@ -31,6 +33,9 @@ app = typer.Typer(
 )
 console = Console()
 err_console = Console(stderr=True)
+
+import_app = typer.Typer(help="Import from external sources.", no_args_is_help=True)
+app.add_typer(import_app, name="import")
 
 
 def _data_folder() -> Path:
@@ -92,7 +97,9 @@ def add(
 
 @app.command(name="list")
 def list_articles(
-    all_articles: bool = typer.Option(False, "--all", "-a", help="Show all articles (read and unread)"),
+    all_articles: bool = typer.Option(
+        False, "--all", "-a", help="Show all articles (read and unread)"
+    ),
     read: bool = typer.Option(False, "--read", "-r", help="Show only read articles"),
 ):
     """List saved articles. Shows only unread articles by default."""
@@ -223,7 +230,9 @@ def delete(
 
 @app.command()
 def backup(
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Directory to save the backup file"),
+    output: Optional[Path] = typer.Option(
+        None, "--output", "-o", help="Directory to save the backup file"
+    ),
 ):
     """Compress all data into a timestamped .zip backup file."""
     data_folder = _data_folder()
@@ -240,7 +249,7 @@ def backup(
         )
         destination = Path(raw).expanduser().resolve()
         save_backup_folder(destination)
-        console.print(f"[dim]Backup location saved to config.[/dim]")
+        console.print("[dim]Backup location saved to config.[/dim]")
 
     destination = Path(destination).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -255,6 +264,95 @@ def backup(
                     zf.write(file, file.relative_to(data_folder))
 
     console.print(f"[bold green]Backup saved:[/bold green] {zip_path}")
+
+
+# ---------------------------------------------------------------------------
+# import pocket
+# ---------------------------------------------------------------------------
+
+
+@import_app.command("pocket")
+def import_pocket(
+    csv_path: Path = typer.Argument(
+        ...,
+        help="Pocket export CSV (for example part_000000.csv)",
+    ),
+):
+    """Import articles from a Pocket CSV export."""
+    data_folder = _data_folder()
+    path = csv_path.expanduser().resolve()
+    if not path.is_file():
+        err_console.print(f"[red]Not a file:[/red] {path}")
+        raise typer.Exit(1)
+
+    rows = list(pocket.pocket_rows(path))
+    if not rows:
+        err_console.print("[yellow]No rows found in CSV[/yellow] (header only or empty file).")
+        raise typer.Exit(0)
+
+    saved = skipped_dup = skipped_invalid = errors = 0
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Importing…[/cyan]", total=len(rows))
+        for row_index, row in enumerate(rows, start=2):
+            url = row.get("url", "").strip()
+            if not url:
+                err_console.print(f"[yellow]Skipping row {row_index}:[/yellow] empty url")
+                skipped_invalid += 1
+                progress.advance(task)
+                continue
+
+            try:
+                index = load_index(data_folder)
+                existing = index.find_by_url(url)
+                if existing is not None:
+                    err_console.print(
+                        f"[yellow]Already saved[/yellow] (id: [bold]{existing.id}[/bold]): "
+                        f"{existing.title}"
+                    )
+                    skipped_dup += 1
+                else:
+                    saved_at, time_fallback = pocket.parse_time_added(row.get("time_added"))
+                    if time_fallback:
+                        err_console.print(
+                            f"[yellow]Warning:[/yellow] row {row_index} — invalid or missing "
+                            f"time_added for {url}; using current UTC time instead."
+                        )
+
+                    extracted = fetch_and_extract(url)
+                    extracted = pocket.apply_pocket_title_fallback(
+                        row.get("title"), url, extracted
+                    )
+
+                    save_article(
+                        data_folder,
+                        extracted,
+                        read=pocket.status_to_read(row.get("status")),
+                        saved_at=saved_at,
+                    )
+                    saved += 1
+            except Exception as exc:
+                err_console.print(
+                    f"[red]Error[/red] row {row_index} {url}: {type(exc).__name__}: {exc}"
+                )
+                errors += 1
+
+            progress.advance(task)
+
+    parts = (
+        f"[bold]Done[/bold] — saved: [green]{saved}[/green]; "
+        f"skipped duplicate: {skipped_dup}; "
+        f"skipped invalid: {skipped_invalid}; "
+    )
+    if errors:
+        console.print(parts + f"errors: [red bold]{errors}[/red bold]")
+    else:
+        console.print(parts + f"errors: {errors}")
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +378,10 @@ def serve(
     if not no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(f"http://localhost:{port}")).start()
 
-    console.print(f"[bold cyan]Starting server at[/bold cyan] http://localhost:{port}  [dim](Ctrl+C to stop)[/dim]")
+    console.print(
+        f"[bold cyan]Starting server at[/bold cyan] http://localhost:{port}  "
+        "[dim](Ctrl+C to stop)[/dim]"
+    )
     uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="warning")
 
 
