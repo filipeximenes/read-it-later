@@ -1,17 +1,31 @@
 from __future__ import annotations
 
+import asyncio
 import re
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
-from ril.models import Article
-from ril.storage import get_article_path, load_index, update_article
+from ril.extractor import fetch_and_extract
+from ril.models import Article, Index
+from ril.storage import delete_article, get_article_path, load_index, save_article, update_article
 
 _FRONT_MATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
+
+_CLI_SEARCH_TIMEOUT_SEC = 120
+
+
+class _SearchUnavailableError(RuntimeError):
+    pass
+
+
+class _AddRequest(BaseModel):
+    url: str
 
 _YT_WATCH_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?.*?v=([A-Za-z0-9_-]+)")
 _YT_SHORT_RE = re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]+)")
@@ -101,6 +115,7 @@ _HTML = """<!DOCTYPE html>
   .badge-read { background: #1e2d1e; color: var(--green); }
   .badge-fail { background: #2d1e1e; color: #f87171; }
   #empty-msg { padding: 24px 16px; color: var(--text-dim); font-size: 13px; text-align: center; }
+  #empty-msg.search-error { color: #f87171; }
 
   /* Content pane */
   #content-pane {
@@ -119,6 +134,7 @@ _HTML = """<!DOCTYPE html>
   #article-meta { font-size: 13px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
   #article-meta a { color: var(--accent); text-decoration: none; }
   #article-meta a:hover { text-decoration: underline; }
+  #article-actions { display: flex; gap: 8px; align-items: center; }
   #toggle-btn {
     padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
     background: var(--surface); color: var(--text); font-size: 13px;
@@ -126,6 +142,12 @@ _HTML = """<!DOCTYPE html>
   }
   #toggle-btn:hover { border-color: var(--accent); color: var(--accent); }
   #toggle-btn.is-read { border-color: var(--green); color: var(--green); }
+  #delete-btn {
+    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text-dim); font-size: 13px;
+    font-weight: 500; cursor: pointer; transition: all .15s;
+  }
+  #delete-btn:hover { border-color: #f87171; color: #f87171; }
   .article-divider { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
 
   /* Markdown body */
@@ -179,6 +201,41 @@ _HTML = """<!DOCTYPE html>
   }
   .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
 
+  /* Add URL bar */
+  #add-url-bar {
+    display: none; align-items: center; gap: 8px;
+    margin-left: auto; flex: 1; max-width: 480px;
+  }
+  #add-url-bar.open { display: flex; }
+  #add-url-input {
+    flex: 1; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-size: 13px; outline: none;
+  }
+  #add-url-input:focus { border-color: var(--accent); }
+  #add-url-submit {
+    padding: 6px 14px; border-radius: 6px; border: none;
+    background: var(--accent); color: #fff; font-size: 13px;
+    font-weight: 500; cursor: pointer; white-space: nowrap;
+    transition: background .15s;
+  }
+  #add-url-submit:hover:not(:disabled) { background: var(--accent-hover); }
+  #add-url-submit:disabled { opacity: 0.6; cursor: default; }
+  #add-url-cancel {
+    padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-dim); font-size: 13px;
+    cursor: pointer; transition: all .15s;
+  }
+  #add-url-cancel:hover { border-color: var(--text-dim); color: var(--text); }
+  #add-btn {
+    margin-left: auto; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid var(--border); background: transparent;
+    color: var(--text-dim); font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: all .15s;
+  }
+  #add-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #add-url-error { font-size: 12px; color: #f87171; white-space: nowrap; }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -201,11 +258,18 @@ _HTML = """<!DOCTYPE html>
     <button class="tab active" data-filter="unread" onclick="switchTab(this)">Unread</button>
     <button class="tab" data-filter="all" onclick="switchTab(this)">All</button>
     <button class="tab" data-filter="read" onclick="switchTab(this)">Read</button>
+    <button id="add-btn" onclick="openAddUrl()">+ Add URL</button>
+    <div id="add-url-bar">
+      <input type="url" id="add-url-input" placeholder="https://…" onkeydown="addUrlKey(event)" />
+      <span id="add-url-error"></span>
+      <button id="add-url-submit" onclick="submitAddUrl()">Save</button>
+      <button id="add-url-cancel" onclick="closeAddUrl()">Cancel</button>
+    </div>
   </nav>
   <div id="main">
     <aside id="sidebar">
       <div id="sidebar-search">
-        <input type="search" id="search-input" placeholder="Search articles…" oninput="renderList()" />
+        <input type="search" id="search-input" placeholder="Search articles…" oninput="scheduleLoadArticles()" />
       </div>
       <ul id="article-list"></ul>
       <div id="empty-msg" style="display:none"></div>
@@ -216,7 +280,10 @@ _HTML = """<!DOCTYPE html>
         <div id="article-header">
           <div id="article-title"></div>
           <div id="article-meta"></div>
-          <button id="toggle-btn" onclick="toggleRead()"></button>
+          <div id="article-actions">
+            <button id="toggle-btn" onclick="toggleRead()"></button>
+            <button id="delete-btn" onclick="deleteArticle()">Delete</button>
+          </div>
         </div>
         <hr class="article-divider">
         <div id="article-body"></div>
@@ -234,11 +301,48 @@ _HTML = """<!DOCTYPE html>
 let allArticles = [];
 let currentFilter = 'unread';
 let currentArticleId = null;
+let searchLoadError = null;
+let loadArticlesDebounced = null;
 
 marked.setOptions({ breaks: true, gfm: true });
 
+function scheduleLoadArticles() {
+  clearTimeout(loadArticlesDebounced);
+  loadArticlesDebounced = setTimeout(() => loadArticles(), 250);
+}
+
 async function loadArticles() {
-  const res = await fetch(`/api/articles?filter=${currentFilter}`);
+  const queryRaw = document.getElementById('search-input').value.trim();
+  const qs = `/api/articles?filter=${currentFilter}`;
+  const url = queryRaw.length ? `${qs}&q=${encodeURIComponent(queryRaw)}` : qs;
+
+  const res = await fetch(url);
+
+  if (!res.ok) {
+    if (queryRaw.length) {
+      let detail = 'Search unavailable (install ripgrep or grep, or retry).';
+      try {
+        const data = await res.json();
+        if (typeof data.detail === 'string') detail = data.detail;
+      } catch (e) { /* ignore */ }
+      searchLoadError = detail;
+      allArticles = [];
+    } else {
+      searchLoadError = null;
+      try {
+        allArticles = await res.json();
+      } catch (e) {
+        allArticles = [];
+      }
+    }
+    renderList();
+    if (currentArticleId && !allArticles.find(a => a.id === currentArticleId)) {
+      showPlaceholder();
+    }
+    return;
+  }
+
+  searchLoadError = null;
   allArticles = await res.json();
   renderList();
   // Clear content pane if current article not in new list
@@ -248,22 +352,26 @@ async function loadArticles() {
 }
 
 function renderList() {
-  const query = document.getElementById('search-input').value.trim().toLowerCase();
+  const query = document.getElementById('search-input').value.trim();
   const list = document.getElementById('article-list');
   const emptyMsg = document.getElementById('empty-msg');
-  const filtered = query
-    ? allArticles.filter(a => a.title.toLowerCase().includes(query) || (a.author || '').toLowerCase().includes(query))
-    : allArticles;
 
-  if (!filtered.length) {
+  if (!allArticles.length) {
     list.innerHTML = '';
     emptyMsg.style.display = '';
-    emptyMsg.textContent = query ? 'No articles match your search.' : 'No articles here.';
+    if (searchLoadError && query.length) {
+      emptyMsg.textContent = searchLoadError;
+      emptyMsg.classList.add('search-error');
+      return;
+    }
+    emptyMsg.classList.remove('search-error');
+    emptyMsg.textContent = query.length ? 'No articles match your search.' : 'No articles here.';
     return;
   }
 
+  emptyMsg.classList.remove('search-error');
   emptyMsg.style.display = 'none';
-  list.innerHTML = filtered.map(a => {
+  list.innerHTML = allArticles.map(a => {
     const isActive = a.id === currentArticleId ? ' active' : '';
     const isRead = a.read ? ' is-read' : '';
     const readBadge = a.read ? '<span class="item-badge badge-read">read</span>' : '';
@@ -331,9 +439,9 @@ function injectInlineVideos(html) {
   // real iframe embeds. Handles two marked.js rendering variants:
   //   Plain:      <p>video-embed:https://...</p>
   //   GFM linked: <p>video-embed:<a href="https://...">https://...</a></p>
-  // Extra \s* guards against any whitespace marked may insert around the content.
+  // Optional whitespace allowed around markers (\\s below in the regexp).
   return html.replace(
-    /<p>\s*video-embed:\s*(?:<a[^>]*href="([^"]+)"[^>]*>[^<]*<\/a>|([^<\s]+))\s*<\/p>/gi,
+    /<p>\\s*video-embed:\\s*(?:<a[^>]*href="([^"]+)"[^>]*>[^<]*<\\/a>|([^<\\s]+))\\s*<\\/p>/gi,
     (_, hrefUrl, textUrl) => {
       const embedUrl = toEmbedUrl(hrefUrl || textUrl);
       if (!embedUrl) return '';
@@ -359,10 +467,10 @@ function toEmbedUrl(url) {
   let m = url.match(/[?&]v=([A-Za-z0-9_-]+)/);
   if (m) return `https://www.youtube.com/embed/${m[1]}`;
   // YouTube short
-  m = url.match(/youtu\.be\/([A-Za-z0-9_-]+)/);
+  m = url.match(/youtu\\.be\\/([A-Za-z0-9_-]+)/);
   if (m) return `https://www.youtube.com/embed/${m[1]}`;
   // Vimeo
-  m = url.match(/vimeo\.com\/(\d+)/);
+  m = url.match(/vimeo\\.com\\/(\\d+)/);
   if (m) return `https://player.vimeo.com/video/${m[1]}`;
   // Already an embed URL — pass through
   if (url.includes('/embed/') || url.includes('player.vimeo')) return url;
@@ -379,6 +487,22 @@ async function toggleRead() {
   renderList();
 }
 
+async function deleteArticle() {
+  if (!currentArticleId) return;
+  const article = allArticles.find(a => a.id === currentArticleId);
+  const title = article ? article.title : 'this article';
+  if (!confirm(`Delete "${title}"?\n\nThis cannot be undone.`)) return;
+
+  const res = await fetch(`/api/articles/${currentArticleId}`, { method: 'DELETE' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    alert(data.detail || 'Failed to delete article.');
+    return;
+  }
+  showPlaceholder();
+  await loadArticles();
+}
+
 function showPlaceholder() {
   currentArticleId = null;
   document.getElementById('placeholder').style.display = 'flex';
@@ -387,6 +511,61 @@ function showPlaceholder() {
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function openAddUrl() {
+  document.getElementById('add-btn').style.display = 'none';
+  document.getElementById('add-url-bar').classList.add('open');
+  document.getElementById('add-url-error').textContent = '';
+  const input = document.getElementById('add-url-input');
+  input.value = '';
+  input.focus();
+}
+
+function closeAddUrl() {
+  document.getElementById('add-url-bar').classList.remove('open');
+  document.getElementById('add-btn').style.display = '';
+  document.getElementById('add-url-error').textContent = '';
+}
+
+function addUrlKey(e) {
+  if (e.key === 'Enter') submitAddUrl();
+  if (e.key === 'Escape') closeAddUrl();
+}
+
+async function submitAddUrl() {
+  const input = document.getElementById('add-url-input');
+  const url = input.value.trim();
+  if (!url) return;
+
+  const submitBtn = document.getElementById('add-url-submit');
+  const errorEl = document.getElementById('add-url-error');
+  errorEl.textContent = '';
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<span class="spinner"></span>Saving…';
+
+  try {
+    const res = await fetch('/api/articles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errorEl.textContent = data.detail || 'Failed to save article.';
+      return;
+    }
+    closeAddUrl();
+    await loadArticles();
+    // Open the newly added article if it exists in the current view
+    const found = allArticles.find(a => a.id === data.id);
+    if (found) openArticle(data.id);
+  } catch (err) {
+    errorEl.textContent = 'Network error. Please try again.';
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = 'Save';
+  }
 }
 
 loadArticles();
@@ -399,6 +578,89 @@ def _strip_front_matter(content: str) -> str:
     return _FRONT_MATTER_RE.sub("", content, count=1).lstrip()
 
 
+def _basename_set_from_cli_stdout(stdout: str) -> set[str]:
+    basenames: set[str] = set()
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line:
+            basenames.add(Path(line).name)
+    return basenames
+
+
+def _article_indices_match(article: Article, needle_lc: str) -> bool:
+    for field in (article.title, article.author, article.description):
+        if field and needle_lc in field.lower():
+            return True
+    return False
+
+
+def _matching_filenames_via_cli(data_folder: Path, needle: str) -> set[str]:
+    """Return basenames under articles/ matching `needle`; requires rg or grep.
+
+    Raises _SearchUnavailableError if no tool could scan the corpus.
+    Vacuous empty set when `articles/` is missing (nothing on disk yet).
+    """
+    articles_dir = data_folder / "articles"
+    if not articles_dir.is_dir():
+        return set()
+
+    errors: list[str] = []
+
+    rg_exe = shutil.which("rg")
+    if rg_exe:
+        try:
+            proc = subprocess.run(
+                [rg_exe, "-l", "-F", "-i", "--glob", "*.md", needle, str(articles_dir)],
+                capture_output=True,
+                text=True,
+                timeout=_CLI_SEARCH_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"ripgrep timed out after {_CLI_SEARCH_TIMEOUT_SEC}s")
+        else:
+            if proc.returncode in (0, 1):
+                return _basename_set_from_cli_stdout(proc.stdout)
+            err = proc.stderr.strip() or f"ripgrep exited with status {proc.returncode}"
+            errors.append(err)
+
+    grep_exe = shutil.which("grep")
+    if grep_exe:
+        try:
+            proc = subprocess.run(
+                [grep_exe, "-R", "-l", "-F", "-i", needle, str(articles_dir)],
+                capture_output=True,
+                text=True,
+                timeout=_CLI_SEARCH_TIMEOUT_SEC,
+            )
+        except subprocess.TimeoutExpired:
+            errors.append(f"grep timed out after {_CLI_SEARCH_TIMEOUT_SEC}s")
+        else:
+            if proc.returncode in (0, 1):
+                return _basename_set_from_cli_stdout(proc.stdout)
+            err = proc.stderr.strip() or f"grep exited with status {proc.returncode}"
+            errors.append(err)
+    elif not rg_exe:
+        raise _SearchUnavailableError(
+            "Body search requires ripgrep (`rg`) or `grep` on PATH; neither was found.",
+        )
+
+    if errors:
+        raise _SearchUnavailableError(
+            "Could not scan article files (" + "; ".join(errors) + "). "
+            "Install ripgrep or fix `grep`; see server logs.",
+        )
+
+    raise RuntimeError("_matching_filenames_via_cli: exhaustive handling failed")
+
+
+def _tab_articles(filter_name: str, index: Index) -> list[Article]:
+    if filter_name == "read":
+        return [a for a in index.articles if a.read]
+    if filter_name == "all":
+        return list(index.articles)
+    return [a for a in index.articles if not a.read]
+
+
 def build_app(data_folder: Path) -> FastAPI:
     app = FastAPI(title="Read It Later", docs_url=None, redoc_url=None)
 
@@ -407,15 +669,23 @@ def build_app(data_folder: Path) -> FastAPI:
         return HTMLResponse(_HTML)
 
     @app.get("/api/articles")
-    async def list_articles(filter: str = "unread") -> list[dict]:
+    async def list_articles(filter: str = "unread", q: Optional[str] = None) -> list[dict]:
         index = load_index(data_folder)
-        if filter == "read":
-            articles = [a for a in index.articles if a.read]
-        elif filter == "all":
-            articles = index.articles
-        else:
-            articles = [a for a in index.articles if not a.read]
-        return [a.model_dump(mode="json") for a in articles]
+        tab_list = _tab_articles(filter, index)
+
+        needle = (q or "").strip().lower()
+        if not needle:
+            return [a.model_dump(mode="json") for a in tab_list]
+
+        try:
+            file_basenames = await asyncio.to_thread(_matching_filenames_via_cli, data_folder, needle)
+        except _SearchUnavailableError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        keep_ids = {a.id for a in tab_list if _article_indices_match(a, needle)}
+        keep_ids |= {a.id for a in tab_list if a.filename in file_basenames}
+        merged = [a for a in tab_list if a.id in keep_ids]
+        return [a.model_dump(mode="json") for a in merged]
 
     @app.get("/api/articles/{article_id}/content")
     async def article_content(article_id: str) -> dict:
@@ -428,6 +698,27 @@ def build_app(data_folder: Path) -> FastAPI:
             raise HTTPException(status_code=404, detail="Article file not found")
         raw = path.read_text(encoding="utf-8")
         return {"content": _strip_front_matter(raw)}
+
+    @app.post("/api/articles", status_code=201)
+    async def add_article(body: _AddRequest) -> dict:
+        url = body.url.strip()
+        if not url:
+            raise HTTPException(status_code=422, detail="URL is required.")
+        index = load_index(data_folder)
+        existing = index.find_by_url(url)
+        if existing is not None:
+            raise HTTPException(status_code=409, detail=f"Article already saved: {existing.title}")
+        extracted = await asyncio.to_thread(fetch_and_extract, url)
+        article = await asyncio.to_thread(save_article, data_folder, extracted)
+        return article.model_dump(mode="json")
+
+    @app.delete("/api/articles/{article_id}", status_code=204)
+    async def remove_article(article_id: str) -> None:
+        index = load_index(data_folder)
+        article = index.find_by_id(article_id)
+        if article is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        delete_article(data_folder, article)
 
     @app.post("/api/articles/{article_id}/toggle-read")
     async def toggle_read(article_id: str) -> dict:
