@@ -22,6 +22,7 @@ from ril.storage import (
     delete_article,
     get_article_path,
     load_index,
+    refresh_article,
     save_article,
     update_article,
 )
@@ -232,6 +233,34 @@ def delete(
 
     delete_article(data_folder, article)
     console.print(f"[red]Deleted:[/red] {article.title}")
+
+
+# ---------------------------------------------------------------------------
+# refresh
+# ---------------------------------------------------------------------------
+
+@app.command()
+def refresh(
+    article_id: str = typer.Argument(..., help="Article ID to re-fetch"),
+):
+    """Re-fetch a saved article and update its content."""
+    data_folder = _data_folder()
+    article = _resolve_article(data_folder, article_id)
+
+    with console.status("[bold cyan]Fetching article…[/bold cyan]"):
+        extracted = fetch_and_extract(article.url)
+
+    if extracted.fetch_failed:
+        err_console.print(
+            f"[yellow]Warning:[/yellow] Could not fetch the article — "
+            f"updating stub entry.\n  {extracted.error}"
+        )
+
+    refresh_article(data_folder, article, extracted)
+    console.print(
+        f"[bold green]Refreshed[/bold green] "
+        f"[bold]{article.title}[/bold]  [dim](id: {article.id})[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------

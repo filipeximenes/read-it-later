@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from ril.extractor import fetch_and_extract
 from ril.models import Article, Index
-from ril.storage import delete_article, get_article_path, load_index, save_article, update_article
+from ril.storage import delete_article, get_article_path, load_index, refresh_article, save_article, update_article
 
 _FRONT_MATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
@@ -149,6 +149,13 @@ _HTML = """<!DOCTYPE html>
     font-weight: 500; cursor: pointer; transition: all .15s;
   }
   #delete-btn:hover { border-color: #f87171; color: #f87171; }
+  #refresh-btn {
+    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text-dim); font-size: 13px;
+    font-weight: 500; cursor: pointer; transition: all .15s;
+  }
+  #refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
   .article-divider { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
 
   /* Markdown body */
@@ -283,6 +290,7 @@ _HTML = """<!DOCTYPE html>
           <div id="article-meta"></div>
           <div id="article-actions">
             <button id="toggle-btn" onclick="toggleRead()"></button>
+            <button id="refresh-btn" onclick="refreshArticle()">↺ Refresh</button>
             <button id="delete-btn" onclick="deleteArticle()">Delete</button>
           </div>
         </div>
@@ -502,6 +510,35 @@ async function deleteArticle() {
   }
   showPlaceholder();
   await loadArticles();
+}
+
+async function refreshArticle() {
+  if (!currentArticleId) return;
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.textContent = '↺ Refreshing…';
+  try {
+    const res = await fetch(`/api/articles/${currentArticleId}/refresh`, { method: 'POST' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.detail || 'Failed to refresh article.');
+      return;
+    }
+    const updated = await res.json();
+    const idx = allArticles.findIndex(a => a.id === currentArticleId);
+    if (idx !== -1) allArticles[idx] = updated;
+    renderArticleHeader(updated);
+    renderList();
+    const contentRes = await fetch(`/api/articles/${currentArticleId}/content`);
+    const contentData = await contentRes.json();
+    document.getElementById('article-body').innerHTML = injectInlineVideos(marked.parse(contentData.content));
+    if (!document.querySelector('#article-body .video-wrapper')) {
+      renderVideos(updated);
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↺ Refresh';
+  }
 }
 
 function showPlaceholder() {
@@ -731,6 +768,16 @@ def build_app(data_folder: Path) -> FastAPI:
         if article is None:
             raise HTTPException(status_code=404, detail="Article not found")
         delete_article(data_folder, article)
+
+    @app.post("/api/articles/{article_id}/refresh")
+    async def refresh_article_endpoint(article_id: str) -> dict:
+        index = load_index(data_folder)
+        article = index.find_by_id(article_id)
+        if article is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        extracted = await asyncio.to_thread(fetch_and_extract, article.url)
+        updated = await asyncio.to_thread(refresh_article, data_folder, article, extracted)
+        return updated.model_dump(mode="json")
 
     @app.post("/api/articles/{article_id}/toggle-read")
     async def toggle_read(article_id: str) -> dict:

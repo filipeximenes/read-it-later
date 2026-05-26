@@ -92,6 +92,26 @@ def update_article(data_folder: Path, article: Article) -> None:
     save_index(data_folder, index)
 
 
+def refresh_article(
+    data_folder: Path,
+    article: Article,
+    extracted: ExtractedArticle,
+) -> Article:
+    article.title = extracted.title
+    article.author = extracted.author
+    article.description = extracted.description
+    article.published_date = extracted.published_date
+    article.tags = extracted.tags
+    article.image_urls = extracted.image_urls
+    article.video_urls = extracted.video_urls
+    article.fetch_failed = extracted.fetch_failed
+
+    article_file = data_folder / "articles" / article.filename
+    _write_markdown_file(article_file, article, extracted)
+    update_article(data_folder, article)
+    return article
+
+
 def get_article_path(data_folder: Path, article: Article) -> Path:
     return data_folder / "articles" / article.filename
 
