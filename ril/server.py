@@ -460,10 +460,17 @@ function injectInlineVideos(html) {
 }
 
 function renderVideos(article) {
-  if (!article || !article.video_urls || !article.video_urls.length) return;
-  const embeds = article.video_urls.map(toEmbedUrl).filter(Boolean);
+  if (!article) return;
+  const videoUrls = [...(article.video_urls || [])];
+  // If the article URL itself is a video (e.g. a YouTube link saved directly),
+  // include it first so the player is always shown.
+  const selfEmbed = toEmbedUrl(article.url);
+  if (selfEmbed && !videoUrls.some(u => toEmbedUrl(u) === selfEmbed)) {
+    videoUrls.unshift(article.url);
+  }
+  if (!videoUrls.length) return;
+  const embeds = videoUrls.map(toEmbedUrl).filter(Boolean);
   if (!embeds.length) return;
-
   const container = document.getElementById('videos-container');
   container.innerHTML = embeds.map(url =>
     `<div class="video-wrapper"><iframe src="${url}" allowfullscreen allow="autoplay; encrypted-media"></iframe></div>`
