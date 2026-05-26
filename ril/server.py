@@ -4,6 +4,7 @@ import asyncio
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -653,12 +654,23 @@ def _matching_filenames_via_cli(data_folder: Path, needle: str) -> set[str]:
     raise RuntimeError("_matching_filenames_via_cli: exhaustive handling failed")
 
 
+def _naive(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=None)
+
+
 def _tab_articles(filter_name: str, index: Index) -> list[Article]:
     if filter_name == "read":
-        return [a for a in index.articles if a.read]
+        return sorted(
+            (a for a in index.articles if a.read),
+            key=lambda a: _naive(a.read_at or a.saved_at),
+            reverse=True,
+        )
     if filter_name == "all":
-        return list(index.articles)
-    return [a for a in index.articles if not a.read]
+        return sorted(index.articles, key=lambda a: _naive(a.saved_at), reverse=True)
+    return sorted(
+        (a for a in index.articles if not a.read),
+        key=lambda a: _naive(a.saved_at),
+    )
 
 
 def build_app(data_folder: Path) -> FastAPI:

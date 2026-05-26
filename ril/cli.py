@@ -106,12 +106,22 @@ def list_articles(
     data_folder = _data_folder()
     index = load_index(data_folder)
 
+    def _naive(dt: datetime) -> datetime:
+        return dt.replace(tzinfo=None)
+
     if all_articles:
-        articles = index.articles
+        articles = sorted(index.articles, key=lambda a: _naive(a.saved_at), reverse=True)
     elif read:
-        articles = [a for a in index.articles if a.read]
+        articles = sorted(
+            (a for a in index.articles if a.read),
+            key=lambda a: _naive(a.read_at or a.saved_at),
+            reverse=True,
+        )
     else:
-        articles = [a for a in index.articles if not a.read]
+        articles = sorted(
+            (a for a in index.articles if not a.read),
+            key=lambda a: _naive(a.saved_at),
+        )
 
     if not articles:
         if read:
