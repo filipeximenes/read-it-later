@@ -76,9 +76,40 @@ def _fetch_html(url: str) -> str:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    response = httpx.get(url, headers=headers, follow_redirects=True, timeout=30)
+    cookies = _get_browser_cookies(url)
+    response = httpx.get(url, headers=headers, cookies=cookies, follow_redirects=True, timeout=30)
     response.raise_for_status()
     return response.text
+
+
+def _get_browser_cookies(url: str) -> dict[str, str]:
+    """Load session cookies from installed browsers for the URL's domain.
+
+    Tries each supported browser individually and merges the results so that
+    a failure in one browser (e.g. Safari permission error) does not prevent
+    cookies from being loaded from others. Returns an empty dict silently if
+    the library is not installed or no browser has cookies for the domain.
+    """
+    try:
+        import browser_cookie3
+    except ImportError:
+        return {}
+
+    domain = urlparse(url).netloc
+    browser_fns = [
+        browser_cookie3.chrome,
+        browser_cookie3.firefox,
+        browser_cookie3.safari,
+    ]
+
+    combined: dict[str, str] = {}
+    for fn in browser_fns:
+        try:
+            for c in fn(domain_name=domain):
+                combined[c.name] = c.value
+        except Exception:
+            continue
+    return combined
 
 
 def _extract(url: str, html: str) -> ExtractedArticle:

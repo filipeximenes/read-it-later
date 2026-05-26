@@ -13,6 +13,7 @@ dependencies = [
     "rich>=15.0.0",
     "trafilatura>=2.0.0",
     "typer>=0.25.1",
+    "browser-cookie3>=0.20.1",
     "uvicorn>=0.34.0",
 ]
 
