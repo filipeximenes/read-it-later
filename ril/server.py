@@ -4,7 +4,8 @@ import asyncio
 import re
 import shutil
 import subprocess
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,75 @@ _HTML = """<!DOCTYPE html>
   }
   .tab:hover { background: var(--surface2); color: var(--text); }
   .tab.active { background: var(--accent); color: #fff; }
+  .tab-count {
+    display: inline-block; min-width: 18px; padding: 0 5px;
+    margin-left: 5px; border-radius: 9px; font-size: 11px; font-weight: 600;
+    background: var(--surface2); color: var(--text-dim); text-align: center;
+  }
+  .tab.active .tab-count { background: rgba(255,255,255,0.22); color: #fff; }
+  .tab-count:empty { display: none; }
+  #stats-btn { margin-left: 8px; }
+
+  /* Stats modal */
+  #stats-overlay {
+    display: none; position: fixed; inset: 0; z-index: 10;
+    background: rgba(0,0,0,0.6); align-items: flex-start; justify-content: center;
+    padding: 48px 20px; overflow-y: auto;
+  }
+  #stats-overlay.open { display: flex; }
+  #stats-modal {
+    width: 100%; max-width: 620px; background: var(--surface);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.5); overflow: hidden;
+  }
+  #stats-modal-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 18px 22px; border-bottom: 1px solid var(--border);
+  }
+  #stats-modal-header h2 { font-size: 17px; font-weight: 700; }
+  #stats-close {
+    border: none; background: transparent; color: var(--text-dim);
+    font-size: 18px; cursor: pointer; line-height: 1; padding: 4px 8px; border-radius: 6px;
+  }
+  #stats-close:hover { background: var(--surface2); color: var(--text); }
+  #stats-content { padding: 22px; }
+  .stats-loading { color: var(--text-dim); font-size: 14px; text-align: center; padding: 30px; }
+
+  .stat-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 26px; }
+  .stat-tile {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .stat-value { font-size: 26px; font-weight: 700; color: var(--text); line-height: 1.1; }
+  .stat-value.accent { color: var(--accent); }
+  .stat-value.green { color: var(--green); }
+  .stat-value.fail { color: #f87171; }
+  .stat-label { font-size: 11px; color: var(--text-dim); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+  .stat-section { margin-bottom: 26px; }
+  .stat-section:last-child { margin-bottom: 0; }
+  .stat-section-title { font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+
+  .progress-bar { height: 10px; background: var(--surface2); border-radius: 6px; overflow: hidden; }
+  .progress-fill { height: 100%; background: var(--green); border-radius: 6px; transition: width .3s; }
+  .progress-label { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+
+  .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
+  .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+  #activity-chart { width: 100%; height: auto; display: block; }
+  #activity-chart .bar-saved { fill: var(--accent); }
+  #activity-chart .bar-read { fill: var(--green); }
+  #activity-chart .axis-label { fill: var(--text-dimmer); font-size: 9px; }
+  #activity-chart .grid-line { stroke: var(--border); stroke-width: 1; }
+
+  .rank-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .rank-row:last-child { border-bottom: none; }
+  .rank-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px; }
+  .rank-count { color: var(--text-dim); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+
+  .tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tag-chip { font-size: 12px; padding: 4px 10px; border-radius: 14px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+  .tag-chip-count { color: var(--text-dim); font-weight: 600; margin-left: 3px; }
 
   /* Main area */
   #main { display: flex; flex: 1; overflow: hidden; }
@@ -263,9 +333,10 @@ _HTML = """<!DOCTYPE html>
 <div id="shell">
   <nav id="topnav">
     <span class="brand">ril</span>
-    <button class="tab active" data-filter="unread" onclick="switchTab(this)">Unread</button>
-    <button class="tab" data-filter="all" onclick="switchTab(this)">All</button>
-    <button class="tab" data-filter="read" onclick="switchTab(this)">Read</button>
+    <button class="tab active" data-filter="unread" onclick="switchTab(this)">Unread <span class="tab-count" id="count-unread"></span></button>
+    <button class="tab" data-filter="all" onclick="switchTab(this)">All <span class="tab-count" id="count-all"></span></button>
+    <button class="tab" data-filter="read" onclick="switchTab(this)">Read <span class="tab-count" id="count-read"></span></button>
+    <button id="stats-btn" class="tab" onclick="openStats()">📊 Stats</button>
     <button id="add-btn" onclick="openAddUrl()">+ Add URL</button>
     <div id="add-url-bar">
       <input type="url" id="add-url-input" placeholder="https://…" onkeydown="addUrlKey(event)" />
@@ -303,6 +374,16 @@ _HTML = """<!DOCTYPE html>
         </div>
       </div>
     </section>
+  </div>
+</div>
+
+<div id="stats-overlay" onclick="maybeCloseStats(event)">
+  <div id="stats-modal">
+    <div id="stats-modal-header">
+      <h2>Statistics</h2>
+      <button id="stats-close" onclick="closeStats()">✕</button>
+    </div>
+    <div id="stats-content"></div>
   </div>
 </div>
 
@@ -501,6 +582,7 @@ async function toggleRead() {
   if (idx !== -1) allArticles[idx] = updated;
   renderArticleHeader(updated);
   renderList();
+  loadStats();
 }
 
 async function deleteArticle() {
@@ -517,6 +599,7 @@ async function deleteArticle() {
   }
   showPlaceholder();
   await loadArticles();
+  loadStats();
 }
 
 async function refreshArticle() {
@@ -602,6 +685,7 @@ async function submitAddUrl() {
     }
     closeAddUrl();
     await loadArticles();
+    loadStats();
     // Open the newly added article if it exists in the current view
     const found = allArticles.find(a => a.id === data.id);
     if (found) openArticle(data.id);
@@ -613,7 +697,130 @@ async function submitAddUrl() {
   }
 }
 
+let statsCache = null;
+
+async function loadStats() {
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) return null;
+    statsCache = await res.json();
+    document.getElementById('count-unread').textContent = statsCache.unread;
+    document.getElementById('count-all').textContent = statsCache.total;
+    document.getElementById('count-read').textContent = statsCache.read;
+    return statsCache;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function openStats() {
+  const overlay = document.getElementById('stats-overlay');
+  const content = document.getElementById('stats-content');
+  overlay.classList.add('open');
+  if (statsCache) renderStats(statsCache);
+  else content.innerHTML = '<div class="stats-loading"><span class="spinner"></span>Loading…</div>';
+  const fresh = await loadStats();
+  renderStats(fresh || statsCache);
+}
+
+function closeStats() {
+  document.getElementById('stats-overlay').classList.remove('open');
+}
+
+function maybeCloseStats(e) {
+  if (e.target.id === 'stats-overlay') closeStats();
+}
+
+function renderStats(s) {
+  const content = document.getElementById('stats-content');
+  if (!s) {
+    content.innerHTML = '<div class="stats-loading">Statistics unavailable.</div>';
+    return;
+  }
+  if (!s.total) {
+    content.innerHTML = '<div class="stats-loading">No articles saved yet.</div>';
+    return;
+  }
+
+  const tiles = [
+    { label: 'Total saved', value: s.total, cls: '' },
+    { label: 'Unread', value: s.unread, cls: 'accent' },
+    { label: 'Read', value: s.read, cls: 'green' },
+    { label: 'Saved this week', value: s.saved_this_week, cls: '' },
+    { label: 'Read this week', value: s.read_this_week, cls: '' },
+    { label: 'Failed fetches', value: s.failed, cls: s.failed ? 'fail' : '' },
+  ];
+  const tilesHtml = tiles.map(t =>
+    `<div class="stat-tile"><div class="stat-value ${t.cls}">${t.value}</div><div class="stat-label">${t.label}</div></div>`
+  ).join('');
+
+  const progress = `<div class="stat-section">
+    <div class="stat-section-title">Reading progress</div>
+    <div class="progress-bar"><div class="progress-fill" style="width:${s.read_pct}%"></div></div>
+    <div class="progress-label">${s.read_pct}% read · ${s.read} of ${s.total} articles</div>
+  </div>`;
+
+  const chart = `<div class="stat-section">
+    <div class="stat-section-title">Activity — last 8 weeks</div>
+    <div class="chart-legend">
+      <span><span class="swatch" style="background:var(--accent)"></span>Saved</span>
+      <span><span class="swatch" style="background:var(--green)"></span>Read</span>
+    </div>
+    ${buildActivityChart(s.weekly)}
+  </div>`;
+
+  const authorsHtml = s.top_authors.length ? `<div class="stat-section">
+    <div class="stat-section-title">Top authors</div>
+    ${s.top_authors.map(([name, count]) =>
+      `<div class="rank-row"><span class="rank-name">${escHtml(name)}</span><span class="rank-count">${count}</span></div>`
+    ).join('')}
+  </div>` : '';
+
+  const tagsHtml = s.top_tags.length ? `<div class="stat-section">
+    <div class="stat-section-title">Top tags</div>
+    <div class="tag-cloud">${s.top_tags.map(([tag, count]) =>
+      `<span class="tag-chip">${escHtml(tag)}<span class="tag-chip-count">${count}</span></span>`
+    ).join('')}</div>
+  </div>` : '';
+
+  content.innerHTML = `<div class="stat-tiles">${tilesHtml}</div>${progress}${chart}${authorsHtml}${tagsHtml}`;
+}
+
+function buildActivityChart(weekly) {
+  if (!weekly || !weekly.length) return '';
+  const W = 560, H = 200, padL = 26, padR = 8, padT = 10, padB = 30;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const n = weekly.length;
+  const maxVal = Math.max(1, ...weekly.flatMap(d => [d.saved, d.read]));
+  const groupW = plotW / n;
+  const barW = Math.max(4, Math.min(16, groupW / 2 - 4));
+  const y = v => padT + plotH - (v / maxVal) * plotH;
+
+  // Gridlines + y ticks at 0, mid, max
+  const ticks = [0, Math.round(maxVal / 2), maxVal].filter((v, i, a) => a.indexOf(v) === i);
+  const grid = ticks.map(v =>
+    `<line class="grid-line" x1="${padL}" y1="${y(v)}" x2="${W - padR}" y2="${y(v)}"></line>` +
+    `<text class="axis-label" x="${padL - 5}" y="${y(v) + 3}" text-anchor="end">${v}</text>`
+  ).join('');
+
+  const bars = weekly.map((d, i) => {
+    const cx = padL + groupW * i + groupW / 2;
+    const savedX = cx - barW - 1, readX = cx + 1;
+    const s = `<rect class="bar-saved" x="${savedX}" y="${y(d.saved)}" width="${barW}" height="${padT + plotH - y(d.saved)}" rx="2"></rect>`;
+    const r = `<rect class="bar-read" x="${readX}" y="${y(d.read)}" width="${barW}" height="${padT + plotH - y(d.read)}" rx="2"></rect>`;
+    const lbl = `<text class="axis-label" x="${cx}" y="${H - 10}" text-anchor="middle">${escHtml(d.label)}</text>`;
+    return s + r + lbl;
+  }).join('');
+
+  return `<svg id="activity-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Weekly saved and read activity">${grid}${bars}</svg>`;
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && document.getElementById('stats-overlay').classList.contains('open')) closeStats();
+});
+
 loadArticles();
+loadStats();
 </script>
 </body>
 </html>"""
@@ -717,6 +924,51 @@ def _tab_articles(filter_name: str, index: Index) -> list[Article]:
     )
 
 
+def _weekly_activity(articles: list[Article], now: datetime, weeks: int = 8) -> list[dict]:
+    """Buckets of saved/read counts per week, oldest first (index -1 == current week)."""
+    saved = [0] * weeks
+    read = [0] * weeks
+    for a in articles:
+        b = (now - _naive(a.saved_at)).days // 7
+        if 0 <= b < weeks:
+            saved[weeks - 1 - b] += 1
+        if a.read_at is not None:
+            br = (now - _naive(a.read_at)).days // 7
+            if 0 <= br < weeks:
+                read[weeks - 1 - br] += 1
+    out: list[dict] = []
+    for i in range(weeks):
+        start = now - timedelta(days=7 * (weeks - 1 - i))
+        out.append({"label": start.strftime("%b %d"), "saved": saved[i], "read": read[i]})
+    return out
+
+
+def _compute_stats(index: Index) -> dict:
+    articles = index.articles
+    total = len(articles)
+    read = sum(1 for a in articles if a.read)
+    failed = sum(1 for a in articles if a.fetch_failed)
+    now = datetime.utcnow()
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+    authors = Counter(a.author for a in articles if a.author)
+    tags = Counter(t for a in articles for t in a.tags)
+    return {
+        "total": total,
+        "unread": total - read,
+        "read": read,
+        "failed": failed,
+        "read_pct": round(read / total * 100) if total else 0,
+        "saved_this_week": sum(1 for a in articles if _naive(a.saved_at) >= week_ago),
+        "read_this_week": sum(1 for a in articles if a.read_at and _naive(a.read_at) >= week_ago),
+        "saved_this_month": sum(1 for a in articles if _naive(a.saved_at) >= month_ago),
+        "read_this_month": sum(1 for a in articles if a.read_at and _naive(a.read_at) >= month_ago),
+        "top_authors": authors.most_common(5),
+        "top_tags": tags.most_common(10),
+        "weekly": _weekly_activity(articles, now),
+    }
+
+
 def build_app(data_folder: Path) -> FastAPI:
     app = FastAPI(title="Read It Later", docs_url=None, redoc_url=None)
 
@@ -742,6 +994,11 @@ def build_app(data_folder: Path) -> FastAPI:
         keep_ids |= {a.id for a in tab_list if a.filename in file_basenames}
         merged = [a for a in tab_list if a.id in keep_ids]
         return [a.model_dump(mode="json") for a in merged]
+
+    @app.get("/api/stats")
+    async def stats() -> dict:
+        index = load_index(data_folder)
+        return _compute_stats(index)
 
     @app.get("/api/articles/{article_id}/content")
     async def article_content(article_id: str) -> dict:
