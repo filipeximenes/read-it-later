@@ -127,11 +127,26 @@ _HTML = """<!DOCTYPE html>
   .stat-section { margin-bottom: 26px; }
   .stat-section:last-child { margin-bottom: 0; }
   .stat-section-title { font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .stat-section-head .stat-section-title { margin-bottom: 0; }
+  .period-toggle { display: flex; gap: 2px; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
+  .period-btn { border: none; background: transparent; color: var(--text-dim); font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 5px; cursor: pointer; transition: all .12s; }
+  .period-btn:hover { color: var(--text); }
+  .period-btn.active { background: var(--accent); color: #fff; }
 
   .progress-bar { height: 10px; background: var(--surface2); border-radius: 6px; overflow: hidden; }
   .progress-fill { height: 100%; background: var(--green); border-radius: 6px; transition: width .3s; }
   .progress-label { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
 
+  .chart-nav { display: flex; align-items: center; justify-content: center; gap: 14px; margin-bottom: 10px; }
+  .chart-range { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 150px; text-align: center; }
+  .nav-arrow {
+    border: 1px solid var(--border); background: var(--surface2); color: var(--text);
+    width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 15px;
+    line-height: 1; display: flex; align-items: center; justify-content: center; transition: all .12s;
+  }
+  .nav-arrow:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .nav-arrow:disabled { opacity: 0.35; cursor: default; }
   .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
   .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
   #activity-chart { width: 100%; height: auto; display: block; }
@@ -139,6 +154,21 @@ _HTML = """<!DOCTYPE html>
   #activity-chart .bar-read { fill: var(--green); }
   #activity-chart .axis-label { fill: var(--text-dimmer); font-size: 9px; }
   #activity-chart .grid-line { stroke: var(--border); stroke-width: 1; }
+  #activity-chart .hover-zone { fill: transparent; }
+  #activity-chart .hover-zone:hover { fill: rgba(91,127,255,0.08); }
+  #chart-wrap { position: relative; }
+  #chart-tooltip {
+    display: none; position: absolute; pointer-events: none; z-index: 2;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12px; white-space: nowrap;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+  }
+  #chart-tooltip .tip-date { font-weight: 600; color: var(--text); margin-bottom: 5px; }
+  #chart-tooltip .tip-row { display: flex; align-items: center; gap: 6px; color: var(--text-dim); line-height: 1.6; }
+  #chart-tooltip .tip-row b { color: var(--text); margin-left: 14px; font-variant-numeric: tabular-nums; }
+  #chart-tooltip .tip-dot { width: 8px; height: 8px; border-radius: 2px; display: inline-block; flex-shrink: 0; }
+  #chart-tooltip .tip-dot.saved { background: var(--accent); }
+  #chart-tooltip .tip-dot.read { background: var(--green); }
 
   .rank-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
   .rank-row:last-child { border-bottom: none; }
@@ -698,6 +728,59 @@ async function submitAddUrl() {
 }
 
 let statsCache = null;
+const ACTIVITY_PERIODS = [
+  { key: '8w',  label: '8 wk',  unit: 'week',  count: 8 },
+  { key: '26w', label: '26 wk', unit: 'week',  count: 26 },
+  { key: '12m', label: '12 mo', unit: 'month', count: 12 },
+];
+let activityPeriod = '8w';
+let activityOffset = 0;
+let activityData = [];
+let activityReqKey = null;
+
+function setActivityPeriod(key) {
+  if (!ACTIVITY_PERIODS.find(x => x.key === key)) return;
+  activityPeriod = key;
+  activityOffset = 0;  // jump back to the most-recent window
+  document.querySelectorAll('.period-btn').forEach(b => b.classList.toggle('active', b.dataset.key === key));
+  loadActivity();
+}
+
+function shiftActivity(dir) {
+  // dir = +1 goes older (back in time), -1 goes newer (toward now).
+  const p = ACTIVITY_PERIODS.find(x => x.key === activityPeriod);
+  const next = activityOffset + dir * p.count;
+  if (next < 0) return;
+  activityOffset = next;
+  loadActivity();
+}
+
+async function loadActivity() {
+  const p = ACTIVITY_PERIODS.find(x => x.key === activityPeriod);
+  const slot = document.getElementById('activity-chart-slot');
+  if (slot) slot.innerHTML = '<div class="stats-loading"><span class="spinner"></span></div>';
+  const reqKey = `${activityPeriod}:${activityOffset}`;
+  activityReqKey = reqKey;
+  let payload = { buckets: [], has_older: false, has_newer: activityOffset > 0 };
+  try {
+    const res = await fetch(`/api/activity?unit=${p.unit}&count=${p.count}&offset=${activityOffset}`);
+    if (res.ok) payload = await res.json();
+  } catch (e) { /* fall through to empty */ }
+  if (activityReqKey !== reqKey) return;  // a newer request superseded this one
+  activityData = payload.buckets || [];
+  const slot2 = document.getElementById('activity-chart-slot');
+  if (slot2) slot2.innerHTML = buildActivityChart(activityData);
+  const range = document.getElementById('chart-range');
+  if (range) {
+    range.textContent = activityData.length
+      ? `${activityData[0].label} – ${activityData[activityData.length - 1].label}`
+      : '—';
+  }
+  const older = document.getElementById('nav-older');
+  const newer = document.getElementById('nav-newer');
+  if (older) older.disabled = !payload.has_older;
+  if (newer) newer.disabled = !payload.has_newer;
+}
 
 async function loadStats() {
   try {
@@ -742,13 +825,14 @@ function renderStats(s) {
     return;
   }
 
+  const fmtDays = v => (v == null ? '—' : v + 'd');
   const tiles = [
-    { label: 'Total saved', value: s.total, cls: '' },
-    { label: 'Unread', value: s.unread, cls: 'accent' },
-    { label: 'Read', value: s.read, cls: 'green' },
-    { label: 'Saved this week', value: s.saved_this_week, cls: '' },
-    { label: 'Read this week', value: s.read_this_week, cls: '' },
-    { label: 'Failed fetches', value: s.failed, cls: s.failed ? 'fail' : '' },
+    { label: 'Saved this week', value: s.saved_this_week, cls: 'accent' },
+    { label: 'Read this week', value: s.read_this_week, cls: 'green' },
+    { label: 'Median time to read', value: fmtDays(s.median_days_to_read), cls: '' },
+    { label: 'Saved this month', value: s.saved_this_month, cls: 'accent' },
+    { label: 'Read this month', value: s.read_this_month, cls: 'green' },
+    { label: 'Oldest unread', value: fmtDays(s.oldest_unread_days), cls: '' },
   ];
   const tilesHtml = tiles.map(t =>
     `<div class="stat-tile"><div class="stat-value ${t.cls}">${t.value}</div><div class="stat-label">${t.label}</div></div>`
@@ -760,13 +844,26 @@ function renderStats(s) {
     <div class="progress-label">${s.read_pct}% read · ${s.read} of ${s.total} articles</div>
   </div>`;
 
+  activityPeriod = '8w';
+  activityOffset = 0;
+  const periodBtns = ACTIVITY_PERIODS.map(p =>
+    `<button class="period-btn${p.key === activityPeriod ? ' active' : ''}" data-key="${p.key}" onclick="setActivityPeriod('${p.key}')">${p.label}</button>`
+  ).join('');
   const chart = `<div class="stat-section">
-    <div class="stat-section-title">Activity — last 8 weeks</div>
+    <div class="stat-section-head">
+      <div class="stat-section-title">Activity</div>
+      <div class="period-toggle">${periodBtns}</div>
+    </div>
     <div class="chart-legend">
       <span><span class="swatch" style="background:var(--accent)"></span>Saved</span>
       <span><span class="swatch" style="background:var(--green)"></span>Read</span>
     </div>
-    ${buildActivityChart(s.weekly)}
+    <div class="chart-nav">
+      <button class="nav-arrow" id="nav-older" onclick="shiftActivity(1)" aria-label="Older">‹</button>
+      <span class="chart-range" id="chart-range">—</span>
+      <button class="nav-arrow" id="nav-newer" onclick="shiftActivity(-1)" aria-label="Newer" disabled>›</button>
+    </div>
+    <div id="activity-chart-slot"><div class="stats-loading"><span class="spinner"></span></div></div>
   </div>`;
 
   const authorsHtml = s.top_authors.length ? `<div class="stat-section">
@@ -784,6 +881,7 @@ function renderStats(s) {
   </div>` : '';
 
   content.innerHTML = `<div class="stat-tiles">${tilesHtml}</div>${progress}${chart}${authorsHtml}${tagsHtml}`;
+  loadActivity();
 }
 
 function buildActivityChart(weekly) {
@@ -803,16 +901,51 @@ function buildActivityChart(weekly) {
     `<text class="axis-label" x="${padL - 5}" y="${y(v) + 3}" text-anchor="end">${v}</text>`
   ).join('');
 
+  // Thin x-axis labels when there are many buckets so they don't collide.
+  const labelEvery = n > 14 ? Math.ceil(n / 10) : 1;
   const bars = weekly.map((d, i) => {
     const cx = padL + groupW * i + groupW / 2;
     const savedX = cx - barW - 1, readX = cx + 1;
     const s = `<rect class="bar-saved" x="${savedX}" y="${y(d.saved)}" width="${barW}" height="${padT + plotH - y(d.saved)}" rx="2"></rect>`;
     const r = `<rect class="bar-read" x="${readX}" y="${y(d.read)}" width="${barW}" height="${padT + plotH - y(d.read)}" rx="2"></rect>`;
-    const lbl = `<text class="axis-label" x="${cx}" y="${H - 10}" text-anchor="middle">${escHtml(d.label)}</text>`;
+    const showLbl = (i % labelEvery === 0) || (i === n - 1);
+    const lbl = showLbl ? `<text class="axis-label" x="${cx}" y="${H - 10}" text-anchor="middle">${escHtml(d.label)}</text>` : '';
     return s + r + lbl;
   }).join('');
 
-  return `<svg id="activity-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Weekly saved and read activity">${grid}${bars}</svg>`;
+  // Transparent per-week hover zones (drawn last so they sit on top and capture events).
+  const zones = weekly.map((d, i) =>
+    `<rect class="hover-zone" x="${padL + groupW * i}" y="${padT}" width="${groupW}" height="${plotH}" rx="3" onmousemove="showChartTip(event, ${i})" onmouseleave="hideChartTip()"></rect>`
+  ).join('');
+
+  return `<div id="chart-wrap">
+    <svg id="activity-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Weekly saved and read activity">${grid}${bars}${zones}</svg>
+    <div id="chart-tooltip"></div>
+  </div>`;
+}
+
+function showChartTip(evt, i) {
+  const wk = activityData && activityData[i];
+  if (!wk) return;
+  const tip = document.getElementById('chart-tooltip');
+  const wrap = document.getElementById('chart-wrap');
+  if (!tip || !wrap) return;
+  tip.innerHTML = `<div class="tip-date">${escHtml(wk.label)}</div>
+    <div class="tip-row"><span class="tip-dot saved"></span>Saved <b>${wk.saved}</b></div>
+    <div class="tip-row"><span class="tip-dot read"></span>Read <b>${wk.read}</b></div>`;
+  tip.style.display = 'block';
+  const wrapRect = wrap.getBoundingClientRect();
+  const x = evt.clientX - wrapRect.left;
+  const y = evt.clientY - wrapRect.top;
+  const left = Math.max(0, Math.min(x + 14, wrap.clientWidth - tip.offsetWidth - 2));
+  const top = Math.max(0, y - tip.offsetHeight - 10);
+  tip.style.left = left + 'px';
+  tip.style.top = top + 'px';
+}
+
+function hideChartTip() {
+  const tip = document.getElementById('chart-tooltip');
+  if (tip) tip.style.display = 'none';
 }
 
 document.addEventListener('keydown', e => {
@@ -924,23 +1057,43 @@ def _tab_articles(filter_name: str, index: Index) -> list[Article]:
     )
 
 
-def _weekly_activity(articles: list[Article], now: datetime, weeks: int = 8) -> list[dict]:
-    """Buckets of saved/read counts per week, oldest first (index -1 == current week)."""
-    saved = [0] * weeks
-    read = [0] * weeks
+def _bucket_index(dt: datetime, now: datetime, unit: str) -> int:
+    """How many buckets ago `dt` falls (0 == current bucket)."""
+    if unit == "month":
+        return (now.year * 12 + now.month) - (dt.year * 12 + dt.month)
+    return (now - dt).days // 7
+
+
+def _bucket_label(back: int, now: datetime, unit: str) -> str:
+    if unit == "month":
+        total = now.year * 12 + (now.month - 1) - back
+        return datetime(total // 12, total % 12 + 1, 1).strftime("%b '%y")
+    return (now - timedelta(days=7 * back)).strftime("%b %d")
+
+
+def _bucket_activity(
+    articles: list[Article], now: datetime, unit: str, count: int, offset: int = 0
+) -> list[dict]:
+    """Saved/read counts per period bucket, oldest first (index -1 == newest in window).
+
+    `offset` shifts the window back in time: offset=0 ends at the current period,
+    offset=count shows the immediately preceding window, and so on.
+    """
+    saved = [0] * count
+    read = [0] * count
+    lo, hi = offset, offset + count
     for a in articles:
-        b = (now - _naive(a.saved_at)).days // 7
-        if 0 <= b < weeks:
-            saved[weeks - 1 - b] += 1
+        b = _bucket_index(_naive(a.saved_at), now, unit)
+        if lo <= b < hi:
+            saved[count - 1 - (b - offset)] += 1
         if a.read_at is not None:
-            br = (now - _naive(a.read_at)).days // 7
-            if 0 <= br < weeks:
-                read[weeks - 1 - br] += 1
-    out: list[dict] = []
-    for i in range(weeks):
-        start = now - timedelta(days=7 * (weeks - 1 - i))
-        out.append({"label": start.strftime("%b %d"), "saved": saved[i], "read": read[i]})
-    return out
+            br = _bucket_index(_naive(a.read_at), now, unit)
+            if lo <= br < hi:
+                read[count - 1 - (br - offset)] += 1
+    return [
+        {"label": _bucket_label(count - 1 - i + offset, now, unit), "saved": saved[i], "read": read[i]}
+        for i in range(count)
+    ]
 
 
 def _compute_stats(index: Index) -> dict:
@@ -953,19 +1106,44 @@ def _compute_stats(index: Index) -> dict:
     month_ago = now - timedelta(days=30)
     authors = Counter(a.author for a in articles if a.author)
     tags = Counter(t for a in articles for t in a.tags)
+    # Round for display, but never show 0%/100% unless it is exactly true —
+    # a full bar with unread items left is misleading.
+    if total == 0:
+        read_pct = 0
+    elif read == total:
+        read_pct = 100
+    else:
+        read_pct = min(99, max(1, round(read / total * 100)))
+    # How long read articles sat between being saved and read (median is robust
+    # against the occasional years-old article finally getting read).
+    durations = sorted(
+        max(0, (_naive(a.read_at) - _naive(a.saved_at)).days)
+        for a in articles
+        if a.read and a.read_at is not None
+    )
+    if durations:
+        mid = len(durations) // 2
+        median_ttr = durations[mid] if len(durations) % 2 else round((durations[mid - 1] + durations[mid]) / 2)
+    else:
+        median_ttr = None
+    oldest_unread = max(
+        ((now - _naive(a.saved_at)).days for a in articles if not a.read),
+        default=None,
+    )
     return {
         "total": total,
         "unread": total - read,
         "read": read,
         "failed": failed,
-        "read_pct": round(read / total * 100) if total else 0,
+        "read_pct": read_pct,
         "saved_this_week": sum(1 for a in articles if _naive(a.saved_at) >= week_ago),
         "read_this_week": sum(1 for a in articles if a.read_at and _naive(a.read_at) >= week_ago),
         "saved_this_month": sum(1 for a in articles if _naive(a.saved_at) >= month_ago),
         "read_this_month": sum(1 for a in articles if a.read_at and _naive(a.read_at) >= month_ago),
+        "median_days_to_read": median_ttr,
+        "oldest_unread_days": oldest_unread,
         "top_authors": authors.most_common(5),
         "top_tags": tags.most_common(10),
-        "weekly": _weekly_activity(articles, now),
     }
 
 
@@ -999,6 +1177,22 @@ def build_app(data_folder: Path) -> FastAPI:
     async def stats() -> dict:
         index = load_index(data_folder)
         return _compute_stats(index)
+
+    @app.get("/api/activity")
+    async def activity(unit: str = "week", count: int = 8, offset: int = 0) -> dict:
+        unit = "month" if unit == "month" else "week"
+        count = max(1, min(52, count))
+        offset = max(0, min(offset, 5200))
+        index = load_index(data_folder)
+        now = datetime.utcnow()
+        buckets = _bucket_activity(index.articles, now, unit, count, offset)
+        oldest = offset + count
+        has_older = any(
+            _bucket_index(_naive(a.saved_at), now, unit) >= oldest
+            or (a.read_at is not None and _bucket_index(_naive(a.read_at), now, unit) >= oldest)
+            for a in index.articles
+        )
+        return {"buckets": buckets, "has_older": has_older, "has_newer": offset > 0}
 
     @app.get("/api/articles/{article_id}/content")
     async def article_content(article_id: str) -> dict:
