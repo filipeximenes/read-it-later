@@ -1114,12 +1114,14 @@ def _compute_stats(index: Index) -> dict:
         read_pct = 100
     else:
         read_pct = min(99, max(1, round(read / total * 100)))
-    # How long read articles sat between being saved and read (median is robust
-    # against the occasional years-old article finally getting read).
+    # How long recently-read articles sat between being saved and read. Scoped to
+    # the last 3 months so the figure reflects current habits, and median-based so
+    # the occasional years-old article finally getting read doesn't skew it.
+    three_months_ago = now - timedelta(days=90)
     durations = sorted(
         max(0, (_naive(a.read_at) - _naive(a.saved_at)).days)
         for a in articles
-        if a.read and a.read_at is not None
+        if a.read and a.read_at is not None and _naive(a.read_at) >= three_months_ago
     )
     if durations:
         mid = len(durations) // 2
