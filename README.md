@@ -10,6 +10,8 @@ A command-line tool to save, store, and track articles for later reading. Articl
 - Tracks read/unread status in a local `index.json`
 - Gracefully handles unreachable URLs (saves a stub entry)
 - Prevents duplicate saves of the same URL
+- Mobile-first web reader (`ril serve`) that also works as a two-pane desktop app
+- Export the whole library to a `.zip`, and restore it on another machine
 
 ## Requirements
 
@@ -120,6 +122,50 @@ ril delete ed6348d6           # prompts for confirmation
 ril delete --force ed6348d6   # skip confirmation
 ```
 
+### Export a backup
+
+```bash
+ril export                              # writes to your saved export folder
+ril export -o ~/Dropbox                 # a directory: timestamped file inside it
+ril export -o ~/Dropbox/my-library.zip  # an exact file path
+```
+
+The archive holds `index.json` plus every article `.md`, so it is a complete,
+portable copy of your library.
+
+`ril backup` is the old name for this command. It still works and does exactly
+the same thing, but `ril export` is the name to use.
+
+You can also export from the web reader: **⋯ → Export backup (.zip)**.
+
+### Restore from a backup
+
+```bash
+ril import backup ~/Dropbox/ril-export-2026-08-30_09-14-22.zip
+```
+
+This **replaces** your library — every article not in the archive is deleted, so
+the result matches the archive exactly rather than merging with what you have.
+Because of that:
+
+- It always shows what will change and asks for confirmation. Use `--dry-run` to
+  see the report and stop, or `--force` to skip the prompt in a script.
+- Before touching anything it saves a snapshot of your current data next to your
+  data folder (`ril-pre-restore-<timestamp>.zip`), so the operation can be undone
+  by importing that snapshot. Pass `--no-snapshot` to skip it.
+- Running the same import twice leaves the library in the same state.
+- The archive is validated before anything is written: unsafe paths, corrupt
+  zips, and archives that are not ril backups are rejected without touching your
+  library.
+
+```bash
+ril import backup backup.zip --dry-run   # report only, changes nothing
+ril import backup backup.zip --force     # no confirmation prompt
+```
+
+The web reader has the same flow under **⋯ → Import backup…**, which previews the
+archive and requires an explicit confirmation before replacing anything.
+
 ## Article File Format
 
 Each saved article is a Markdown file with YAML front matter:
@@ -156,6 +202,10 @@ Config file: `~/.config/ril/config.json`
 
 ```json
 {
-  "data_folder": "/Users/you/ReadItLater"
+  "data_folder": "/Users/you/ReadItLater",
+  "backup_folder": "/Users/you/Desktop"
 }
 ```
+
+`backup_folder` is where `ril export` and `ril backup` write when no `--output`
+is given. You are asked for it the first time and it is remembered afterwards.

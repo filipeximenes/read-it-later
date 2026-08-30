@@ -74,7 +74,7 @@ def save_article(
 
 
 def delete_article(data_folder: Path, article: Article) -> None:
-    article_file = data_folder / "articles" / article.filename
+    article_file = get_article_path(data_folder, article)
     if article_file.exists():
         article_file.unlink()
 
@@ -106,14 +106,23 @@ def refresh_article(
     article.video_urls = extracted.video_urls
     article.fetch_failed = extracted.fetch_failed
 
-    article_file = data_folder / "articles" / article.filename
+    article_file = get_article_path(data_folder, article)
     _write_markdown_file(article_file, article, extracted)
     update_article(data_folder, article)
     return article
 
 
 def get_article_path(data_folder: Path, article: Article) -> Path:
-    return data_folder / "articles" / article.filename
+    """Path to an article's markdown file, always inside `{data_folder}/articles`.
+
+    `filename` comes from index.json, which an imported backup can supply, so it
+    is treated as untrusted input rather than as a trusted path fragment.
+    """
+    articles_dir = (data_folder / "articles").resolve()
+    path = (articles_dir / article.filename).resolve()
+    if path.parent != articles_dir:
+        raise ValueError(f"Unsafe article filename: {article.filename!r}")
+    return path
 
 
 def _build_filename(timestamp: datetime, article_id: str, title: str) -> str:

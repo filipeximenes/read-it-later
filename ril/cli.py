@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,6 +14,12 @@ from rich.table import Table
 from rich.text import Text
 
 from ril import pocket
+from ril.archive import (
+    ArchiveError,
+    create_archive,
+    export_filename,
+    restore_archive,
+)
 from ril.config import get_backup_folder, get_data_folder, save_backup_folder
 from ril.extractor import fetch_and_extract
 from ril.models import Article
@@ -178,7 +183,11 @@ def open_article(
     """Open an article in $EDITOR and mark it as read."""
     data_folder = _data_folder()
     article = _resolve_article(data_folder, article_id)
-    article_path = get_article_path(data_folder, article)
+    try:
+        article_path = get_article_path(data_folder, article)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
 
     editor = os.environ.get("EDITOR", "vi")
     subprocess.run([editor, str(article_path)])
@@ -231,7 +240,11 @@ def delete(
             console.print("[dim]Aborted.[/dim]")
             raise typer.Exit(0)
 
-    delete_article(data_folder, article)
+    try:
+        delete_article(data_folder, article)
+    except ValueError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
     console.print(f"[red]Deleted:[/red] {article.title}")
 
 
@@ -264,45 +277,69 @@ def refresh(
 
 
 # ---------------------------------------------------------------------------
-# backup
+# export
 # ---------------------------------------------------------------------------
 
-@app.command()
+
+def _resolve_export_path(output: Optional[Path]) -> Path:
+    """Turn --output into a full .zip path, asking for a folder on first use."""
+    if output is not None:
+        destination = Path(output).expanduser().resolve()
+        # An existing directory, or a path without a .zip suffix, means "put it in here".
+        if destination.is_dir() or destination.suffix.lower() != ".zip":
+            return destination / export_filename()
+        return destination
+
+    destination = get_backup_folder()
+    if destination is None:
+        raw = typer.prompt(
+            "Where should exports be saved?",
+            default=str(Path.home() / "Desktop"),
+        )
+        destination = Path(raw).expanduser().resolve()
+        save_backup_folder(destination)
+        console.print("[dim]Export location saved to config.[/dim]")
+
+    return Path(destination).expanduser().resolve() / export_filename()
+
+
+def _write_export(output: Optional[Path]) -> None:
+    data_folder = _data_folder()
+    zip_path = _resolve_export_path(output)
+
+    with console.status("[bold cyan]Creating archive\u2026[/bold cyan]"):
+        create_archive(data_folder, zip_path)
+
+    size_mb = zip_path.stat().st_size / (1024 * 1024)
+    article_count = len(load_index(data_folder).articles)
+    console.print(
+        f"[bold green]Exported[/bold green] {article_count} article(s) "
+        f"[dim]({size_mb:.1f} MB)[/dim] \u2192 {zip_path}"
+    )
+
+
+@app.command(name="export")
+def export_data(
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Destination .zip file, or a directory to write a timestamped file into",
+    ),
+):
+    """Export every article and the index into a single .zip archive."""
+    _write_export(output)
+
+
+@app.command(hidden=True)
 def backup(
     output: Optional[Path] = typer.Option(
         None, "--output", "-o", help="Directory to save the backup file"
     ),
 ):
-    """Compress all data into a timestamped .zip backup file."""
-    data_folder = _data_folder()
-
-    destination = output
-    if destination is None:
-        destination = get_backup_folder()
-
-    if destination is None:
-        default_dest = Path.home() / "Desktop"
-        raw = typer.prompt(
-            "Where should backups be saved?",
-            default=str(default_dest),
-        )
-        destination = Path(raw).expanduser().resolve()
-        save_backup_folder(destination)
-        console.print("[dim]Backup location saved to config.[/dim]")
-
-    destination = Path(destination).expanduser().resolve()
-    destination.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    zip_path = destination / f"ril-backup-{timestamp}.zip"
-
-    with console.status("[bold cyan]Creating backup…[/bold cyan]"):
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for file in sorted(data_folder.rglob("*")):
-                if file.is_file():
-                    zf.write(file, file.relative_to(data_folder))
-
-    console.print(f"[bold green]Backup saved:[/bold green] {zip_path}")
+    """Deprecated name for `ril export`."""
+    console.print("[dim]`ril backup` is now `ril export`.[/dim]")
+    _write_export(output)
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +429,86 @@ def import_pocket(
         console.print(parts + f"errors: [red bold]{errors}[/red bold]")
     else:
         console.print(parts + f"errors: {errors}")
+
+
+# ---------------------------------------------------------------------------
+# import backup
+# ---------------------------------------------------------------------------
+
+
+@import_app.command("backup")
+def import_backup(
+    zip_path: Path = typer.Argument(..., help="A .zip archive produced by `ril export`"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report what would be restored without changing anything"
+    ),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip the confirmation prompt"),
+    no_snapshot: bool = typer.Option(
+        False, "--no-snapshot", help="Do not save a snapshot of the current data first"
+    ),
+):
+    """Rebuild the library from a backup zip, replacing all existing data."""
+    data_folder = _data_folder()
+    path = zip_path.expanduser().resolve()
+
+    try:
+        preview = restore_archive(data_folder, path, dry_run=True)
+    except ArchiveError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    summary = preview.summary
+    console.print(f"[bold]Archive:[/bold] {path}")
+    console.print(
+        f"  [green]{summary.article_count}[/green] article(s) in the index, "
+        f"{summary.file_count} markdown file(s)"
+    )
+    if summary.missing_files:
+        console.print(
+            f"  [yellow]{len(summary.missing_files)} indexed article(s) have no file[/yellow] "
+            "and will be restored without content"
+        )
+    if summary.orphan_files:
+        console.print(
+            f"  [yellow]{len(summary.orphan_files)} file(s) are not in the index[/yellow] "
+            "and will be ignored"
+        )
+    if summary.skipped_entries:
+        console.print(f"  [dim]{len(summary.skipped_entries)} unrelated entry(ies) skipped[/dim]")
+
+    console.print(f"[bold]Target:[/bold] {data_folder}")
+    console.print(
+        f"  [red]{preview.replaced_articles} existing article(s) will be deleted[/red] "
+        "and replaced by the archive contents"
+    )
+
+    if dry_run:
+        console.print("\n[dim]Dry run \u2014 nothing was changed.[/dim]")
+        raise typer.Exit(0)
+
+    if not force:
+        console.print("")
+        confirmed = typer.confirm(
+            f"Replace ALL data in {data_folder} with this archive?",
+            default=False,
+        )
+        if not confirmed:
+            console.print("[dim]Aborted.[/dim]")
+            raise typer.Exit(0)
+
+    try:
+        with console.status("[bold cyan]Restoring\u2026[/bold cyan]"):
+            result = restore_archive(data_folder, path, make_snapshot=not no_snapshot)
+    except ArchiveError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+    console.print(
+        f"[bold green]Restored[/bold green] {result.summary.article_count} article(s) "
+        f"into {data_folder}"
+    )
+    if result.snapshot_path is not None:
+        console.print(f"[dim]Previous data saved to: {result.snapshot_path}[/dim]")
 
 
 # ---------------------------------------------------------------------------

@@ -4,18 +4,39 @@ import asyncio
 import re
 import shutil
 import subprocess
+import tempfile
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
+from ril.archive import (
+    ArchiveError,
+    create_archive,
+    export_filename,
+    restore_archive,
+)
 from ril.extractor import fetch_and_extract
 from ril.models import Article, Index
-from ril.storage import delete_article, get_article_path, load_index, refresh_article, save_article, update_article
+from ril.storage import (
+    delete_article,
+    get_article_path,
+    load_index,
+    refresh_article,
+    save_article,
+    update_article,
+)
+
+# Import replaces the whole library, so it is guarded by a header a cross-origin
+# page cannot send without a CORS preflight that this app never grants.
+_IMPORT_CONFIRM_HEADER = "x-ril-confirm"
+_IMPORT_CONFIRM_VALUE = "replace-all"
+_MAX_IMPORT_BYTES = 2 * 1024 * 1024 * 1024
 
 _FRONT_MATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
@@ -56,26 +77,45 @@ _HTML = """<!DOCTYPE html>
     --read-bg: #111827;
     --read-text: #6b7280;
     --green: #34d399;
+    --red: #f87171;
     --sidebar-w: 320px;
+    --safe-l: env(safe-area-inset-left, 0px);
+    --safe-r: env(safe-area-inset-right, 0px);
+    --safe-b: env(safe-area-inset-bottom, 0px);
+    --safe-t: env(safe-area-inset-top, 0px);
   }
 
+  html { -webkit-text-size-adjust: 100%; }
   html, body { height: 100%; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+  body { overscroll-behavior-y: none; }
 
-  /* Layout */
-  #shell { display: flex; flex-direction: column; height: 100vh; }
+  /* Layout — one column by default; the sidebar and reader share the screen
+     and swap as you navigate. Two panes appear from the desktop breakpoint. */
+  #shell { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 
   /* Top nav */
   #topnav {
-    display: flex; align-items: center; gap: 4px;
-    padding: 0 20px; height: 52px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    padding: calc(8px + var(--safe-t)) calc(12px + var(--safe-r)) 8px calc(12px + var(--safe-l));
     background: var(--surface); border-bottom: 1px solid var(--border);
     flex-shrink: 0;
   }
-  #topnav .brand { font-weight: 700; font-size: 15px; color: var(--accent); margin-right: 16px; letter-spacing: 0.03em; }
+  .nav-lead { display: flex; align-items: center; gap: 8px; order: 1; min-width: 0; }
+  .nav-actions { display: flex; align-items: center; gap: 6px; order: 2; margin-left: auto; }
+  #topnav .brand { font-weight: 700; font-size: 16px; color: var(--accent); letter-spacing: 0.03em; }
+
+  #tabbar {
+    order: 3; flex-basis: 100%; display: flex; gap: 4px;
+    overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  }
+  #tabbar::-webkit-scrollbar { display: none; }
+
   .tab {
-    padding: 6px 14px; border-radius: 6px; border: none;
+    display: flex; align-items: center; flex-shrink: 0;
+    padding: 8px 13px; min-height: 38px; border-radius: 8px; border: none;
     background: transparent; color: var(--text-dim);
     font-size: 14px; font-weight: 500; cursor: pointer; transition: all .15s;
+    white-space: nowrap;
   }
   .tab:hover { background: var(--surface2); color: var(--text); }
   .tab.active { background: var(--accent); color: #fff; }
@@ -86,51 +126,283 @@ _HTML = """<!DOCTYPE html>
   }
   .tab.active .tab-count { background: rgba(255,255,255,0.22); color: #fff; }
   .tab-count:empty { display: none; }
-  #stats-btn { margin-left: 8px; }
 
-  /* Stats modal */
-  #stats-overlay {
-    display: none; position: fixed; inset: 0; z-index: 10;
-    background: rgba(0,0,0,0.6); align-items: flex-start; justify-content: center;
-    padding: 48px 20px; overflow-y: auto;
+  /* Icon / action buttons — sized for touch first */
+  .icon-btn {
+    display: flex; align-items: center; justify-content: center; gap: 6px;
+    min-width: 40px; height: 40px; padding: 0 11px; flex-shrink: 0;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-dim);
+    font-size: 15px; font-weight: 500; cursor: pointer; transition: all .15s;
   }
-  #stats-overlay.open { display: flex; }
-  #stats-modal {
-    width: 100%; max-width: 620px; background: var(--surface);
-    border: 1px solid var(--border); border-radius: 12px;
-    box-shadow: 0 24px 60px rgba(0,0,0,0.5); overflow: hidden;
+  .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-label { display: none; }
+
+  #back-btn { display: none; }
+  body.reading #back-btn { display: flex; }
+
+  /* Overflow menu */
+  #menu-wrap { position: relative; }
+  #menu {
+    display: none; position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+    min-width: 200px; padding: 6px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; box-shadow: 0 16px 40px rgba(0,0,0,0.55);
   }
-  #stats-modal-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 18px 22px; border-bottom: 1px solid var(--border);
+  #menu.open { display: block; }
+  .menu-item {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 10px 12px; min-height: 44px;
+    border: none; background: transparent; color: var(--text);
+    font-size: 14px; text-align: left; border-radius: 7px; cursor: pointer;
   }
-  #stats-modal-header h2 { font-size: 17px; font-weight: 700; }
-  #stats-close {
+  .menu-item:hover { background: var(--surface2); }
+  .menu-item.danger { color: var(--red); }
+  .menu-sep { height: 1px; background: var(--border); margin: 6px 4px; }
+
+  /* Add URL bar — its own full-width row until there is space beside the tabs */
+  #add-url-bar { display: none; flex-wrap: wrap; align-items: center; gap: 8px; order: 4; flex-basis: 100%; }
+  #add-url-bar.open { display: flex; }
+  #add-url-input {
+    flex: 1; min-width: 0; padding: 10px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-size: 16px; outline: none;
+  }
+  #add-url-input:focus { border-color: var(--accent); }
+  #add-url-submit {
+    height: 40px; padding: 0 16px; border-radius: 8px; border: none;
+    background: var(--accent); color: #fff; font-size: 14px;
+    font-weight: 500; cursor: pointer; white-space: nowrap;
+    transition: background .15s;
+  }
+  #add-url-submit:hover:not(:disabled) { background: var(--accent-hover); }
+  #add-url-submit:disabled { opacity: 0.6; cursor: default; }
+  #add-url-cancel {
+    height: 40px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--border);
+    background: transparent; color: var(--text-dim); font-size: 14px;
+    cursor: pointer; transition: all .15s;
+  }
+  #add-url-cancel:hover { border-color: var(--text-dim); color: var(--text); }
+  #add-url-error { flex-basis: 100%; font-size: 12px; color: var(--red); }
+
+  /* Main area */
+  #main { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+
+  /* Sidebar */
+  #sidebar {
+    width: 100%; flex-shrink: 0;
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+    background: var(--surface);
+  }
+  body.reading #sidebar { display: none; }
+  #sidebar-search {
+    position: sticky; top: 0; z-index: 1;
+    padding: 10px calc(12px + var(--safe-r)) 10px calc(12px + var(--safe-l));
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+  }
+  #sidebar-search input {
+    width: 100%; padding: 11px 12px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--bg);
+    color: var(--text); font-size: 16px; outline: none;
+  }
+  #sidebar-search input:focus { border-color: var(--accent); }
+  #article-list { list-style: none; }
+  .article-item {
+    padding: 14px calc(16px + var(--safe-r)) 14px calc(16px + var(--safe-l));
+    border-bottom: 1px solid var(--border);
+    cursor: pointer; transition: background .12s;
+  }
+  .article-item:hover { background: var(--surface2); }
+  .article-item.active { background: var(--surface2); border-left: 3px solid var(--accent); }
+  .article-item.is-read .item-title { color: var(--read-text); font-weight: 400; }
+  .item-title { font-size: 15px; font-weight: 600; line-height: 1.4; color: var(--text); margin-bottom: 4px; }
+  .item-meta { font-size: 12px; color: var(--text-dimmer); }
+  .item-badge {
+    display: inline-block; font-size: 10px; padding: 1px 5px;
+    border-radius: 3px; margin-left: 4px; vertical-align: middle;
+  }
+  .badge-read { background: #1e2d1e; color: var(--green); }
+  .badge-fail { background: #2d1e1e; color: var(--red); }
+  #empty-msg { padding: 24px 16px; color: var(--text-dim); font-size: 14px; text-align: center; }
+  #empty-msg.search-error { color: var(--red); }
+
+  /* Content pane */
+  #content-pane {
+    display: none; flex: 1;
+    overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 20px calc(16px + var(--safe-r)) calc(32px + var(--safe-b)) calc(16px + var(--safe-l));
+    background: var(--bg);
+  }
+  body.reading #content-pane { display: block; }
+  #placeholder {
+    display: flex; align-items: center; justify-content: center;
+    height: 100%; color: var(--text-dimmer); font-size: 15px;
+  }
+
+  /* Article view */
+  #article-view { max-width: 720px; margin: 0 auto; }
+  #article-header { margin-bottom: 24px; }
+  #article-title { font-size: 22px; font-weight: 700; line-height: 1.3; margin-bottom: 10px; overflow-wrap: break-word; }
+  #article-meta { font-size: 13px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  #article-meta a { color: var(--accent); text-decoration: none; }
+  #article-meta a:hover { text-decoration: underline; }
+  #article-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+  #article-actions button {
+    flex: 1 1 auto; min-height: 42px; padding: 0 14px;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text-dim); font-size: 14px;
+    font-weight: 500; cursor: pointer; transition: all .15s; white-space: nowrap;
+  }
+  #toggle-btn { color: var(--text); }
+  #toggle-btn:hover, #refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+  #toggle-btn.is-read { border-color: var(--green); color: var(--green); }
+  #delete-btn:hover { border-color: var(--red); color: var(--red); }
+  #refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .article-divider { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+
+  /* Markdown body */
+  #article-body { font-size: 17px; line-height: 1.7; color: var(--text); overflow-wrap: break-word; }
+  #article-body h1,
+  #article-body h2,
+  #article-body h3,
+  #article-body h4 { font-weight: 700; line-height: 1.3; margin: 1.6em 0 0.5em; color: var(--text); }
+  #article-body h1 { font-size: 1.5em; }
+  #article-body h2 { font-size: 1.3em; }
+  #article-body h3 { font-size: 1.12em; }
+  #article-body h4 { font-size: 1em; }
+  #article-body p { margin: 0 0 1.1em; }
+  #article-body ul, #article-body ol { margin: 0 0 1.1em 1.25em; }
+  #article-body li { margin-bottom: 0.3em; }
+  #article-body a { color: var(--accent); text-decoration: none; }
+  #article-body a:hover { text-decoration: underline; }
+  #article-body blockquote {
+    border-left: 3px solid var(--accent); margin: 1em 0;
+    padding: 10px 14px; background: var(--surface); border-radius: 0 6px 6px 0;
+    color: var(--text-dim);
+  }
+  #article-body code {
+    font-family: "SF Mono", "Fira Code", Consolas, monospace;
+    font-size: 0.875em; background: var(--surface2);
+    padding: 2px 5px; border-radius: 4px; overflow-wrap: break-word;
+  }
+  #article-body pre {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; margin: 0 0 1.2em;
+  }
+  #article-body pre code { background: none; padding: 0; font-size: 0.85em; white-space: pre; }
+  #article-body img {
+    max-width: 100%; height: auto; border-radius: 8px;
+    margin: 12px 0; display: block;
+  }
+  /* Wide tables scroll on their own instead of stretching the page */
+  #article-body table {
+    display: block; width: max-content; max-width: 100%;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+    border-collapse: collapse; margin: 0 0 1.2em;
+  }
+  #article-body th, #article-body td {
+    border: 1px solid var(--border); padding: 8px 12px; text-align: left;
+  }
+  #article-body th { background: var(--surface2); font-weight: 600; }
+  #article-body hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
+
+  /* Videos section */
+  #videos-section { margin-top: 28px; }
+  #videos-section h3 { font-size: 14px; font-weight: 600; color: var(--text-dim); margin-bottom: 14px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .video-wrapper {
+    position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden;
+    border-radius: 10px; margin-bottom: 18px; background: #000;
+  }
+  .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+
+  /* Modals — full-screen sheets on small screens, centred cards on desktop */
+  .overlay { display: none; position: fixed; inset: 0; z-index: 30; background: rgba(0,0,0,0.65); }
+  .overlay.open { display: flex; }
+  .modal {
+    display: flex; flex-direction: column;
+    width: 100%; height: 100%;
+    background: var(--surface); overflow: hidden;
+  }
+  .modal-header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: calc(14px + var(--safe-t)) 16px 14px;
+    border-bottom: 1px solid var(--border); flex-shrink: 0;
+  }
+  .modal-header h2 { font-size: 17px; font-weight: 700; }
+  .modal-close {
+    display: flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; flex-shrink: 0;
     border: none; background: transparent; color: var(--text-dim);
-    font-size: 18px; cursor: pointer; line-height: 1; padding: 4px 8px; border-radius: 6px;
+    font-size: 18px; cursor: pointer; border-radius: 8px;
   }
-  #stats-close:hover { background: var(--surface2); color: var(--text); }
-  #stats-content { padding: 22px; }
+  .modal-close:hover { background: var(--surface2); color: var(--text); }
+  .modal-body {
+    flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+    padding: 18px 16px calc(18px + var(--safe-b));
+  }
+  .modal-footer {
+    display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0;
+    padding: 14px 16px calc(14px + var(--safe-b));
+    border-top: 1px solid var(--border);
+  }
+  .modal-footer button {
+    flex: 1 1 140px; min-height: 44px; padding: 0 16px;
+    border-radius: 8px; border: 1px solid var(--border);
+    background: var(--surface2); color: var(--text);
+    font-size: 14px; font-weight: 600; cursor: pointer; transition: all .15s;
+  }
+  .modal-footer button:hover:not(:disabled) { border-color: var(--text-dim); }
+  .modal-footer button:disabled { opacity: 0.55; cursor: default; }
+  .btn-danger { background: #7f1d1d; border-color: #991b1b; color: #fff; }
+  .btn-danger:hover:not(:disabled) { background: #991b1b; border-color: #b91c1c; }
+
   .stats-loading { color: var(--text-dim); font-size: 14px; text-align: center; padding: 30px; }
 
-  .stat-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 26px; }
+  /* Import dialog */
+  .summary-row {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 14px;
+  }
+  .summary-row:last-child { border-bottom: none; }
+  .summary-row .k { color: var(--text-dim); }
+  .summary-row .v { font-weight: 600; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  .summary-row .v.warn { color: #fbbf24; }
+  .summary-row .v.danger { color: var(--red); }
+  .summary-title { font-size: 12px; font-weight: 600; color: var(--text-dim); margin: 20px 0 4px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .summary-title:first-child { margin-top: 0; }
+  .warn-box {
+    margin-top: 18px; padding: 12px 14px; border-radius: 9px;
+    background: #2d1e1e; border: 1px solid #7f1d1d;
+    color: #fca5a5; font-size: 13px; line-height: 1.55;
+  }
+  .note-box {
+    margin-top: 12px; padding: 12px 14px; border-radius: 9px;
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text-dim); font-size: 13px; line-height: 1.55;
+  }
+  .file-name { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+
+  /* Stats */
+  .stat-tiles { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 24px; }
   .stat-tile {
     background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 10px; padding: 14px 16px;
+    border-radius: 10px; padding: 13px 14px;
   }
-  .stat-value { font-size: 26px; font-weight: 700; color: var(--text); line-height: 1.1; }
+  .stat-value { font-size: 23px; font-weight: 700; color: var(--text); line-height: 1.1; }
   .stat-value.accent { color: var(--accent); }
   .stat-value.green { color: var(--green); }
-  .stat-value.fail { color: #f87171; }
+  .stat-value.fail { color: var(--red); }
   .stat-label { font-size: 11px; color: var(--text-dim); margin-top: 4px; text-transform: uppercase; letter-spacing: 0.04em; }
 
   .stat-section { margin-bottom: 26px; }
   .stat-section:last-child { margin-bottom: 0; }
   .stat-section-title { font-size: 12px; font-weight: 600; color: var(--text-dim); margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .stat-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .stat-section-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin-bottom: 12px; }
   .stat-section-head .stat-section-title { margin-bottom: 0; }
   .period-toggle { display: flex; gap: 2px; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 2px; }
-  .period-btn { border: none; background: transparent; color: var(--text-dim); font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 5px; cursor: pointer; transition: all .12s; }
+  .period-btn { border: none; background: transparent; color: var(--text-dim); font-size: 12px; font-weight: 600; padding: 6px 11px; border-radius: 5px; cursor: pointer; transition: all .12s; }
   .period-btn:hover { color: var(--text); }
   .period-btn.active { background: var(--accent); color: #fff; }
 
@@ -139,17 +411,18 @@ _HTML = """<!DOCTYPE html>
   .progress-label { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
 
   .chart-nav { display: flex; align-items: center; justify-content: center; gap: 14px; margin-bottom: 10px; }
-  .chart-range { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 150px; text-align: center; }
+  .chart-range { font-size: 12px; color: var(--text-dim); font-variant-numeric: tabular-nums; min-width: 140px; text-align: center; }
   .nav-arrow {
     border: 1px solid var(--border); background: var(--surface2); color: var(--text);
-    width: 26px; height: 26px; border-radius: 6px; cursor: pointer; font-size: 15px;
+    width: 34px; height: 34px; border-radius: 8px; cursor: pointer; font-size: 16px;
     line-height: 1; display: flex; align-items: center; justify-content: center; transition: all .12s;
+    flex-shrink: 0;
   }
   .nav-arrow:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   .nav-arrow:disabled { opacity: 0.35; cursor: default; }
   .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
   .chart-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
-  #activity-chart { width: 100%; height: auto; display: block; }
+  #activity-chart { width: 100%; height: auto; display: block; touch-action: pan-y; }
   #activity-chart .bar-saved { fill: var(--accent); }
   #activity-chart .bar-read { fill: var(--green); }
   #activity-chart .axis-label { fill: var(--text-dimmer); font-size: 9px; }
@@ -170,179 +443,14 @@ _HTML = """<!DOCTYPE html>
   #chart-tooltip .tip-dot.saved { background: var(--accent); }
   #chart-tooltip .tip-dot.read { background: var(--green); }
 
-  .rank-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+  .rank-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 14px; }
   .rank-row:last-child { border-bottom: none; }
   .rank-name { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 12px; }
   .rank-count { color: var(--text-dim); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 
   .tag-cloud { display: flex; flex-wrap: wrap; gap: 8px; }
-  .tag-chip { font-size: 12px; padding: 4px 10px; border-radius: 14px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+  .tag-chip { font-size: 13px; padding: 5px 11px; border-radius: 14px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
   .tag-chip-count { color: var(--text-dim); font-weight: 600; margin-left: 3px; }
-
-  /* Main area */
-  #main { display: flex; flex: 1; overflow: hidden; }
-
-  /* Sidebar */
-  #sidebar {
-    width: var(--sidebar-w); flex-shrink: 0;
-    border-right: 1px solid var(--border);
-    overflow-y: auto; background: var(--surface);
-  }
-  #sidebar-search {
-    position: sticky; top: 0; z-index: 1;
-    padding: 12px; background: var(--surface);
-    border-bottom: 1px solid var(--border);
-  }
-  #sidebar-search input {
-    width: 100%; padding: 7px 10px; border-radius: 6px;
-    border: 1px solid var(--border); background: var(--bg);
-    color: var(--text); font-size: 13px; outline: none;
-  }
-  #sidebar-search input:focus { border-color: var(--accent); }
-  #article-list { list-style: none; }
-  .article-item {
-    padding: 12px 14px; border-bottom: 1px solid var(--border);
-    cursor: pointer; transition: background .12s;
-  }
-  .article-item:hover { background: var(--surface2); }
-  .article-item.active { background: var(--surface2); border-left: 3px solid var(--accent); padding-left: 11px; }
-  .article-item.is-read .item-title { color: var(--read-text); font-weight: 400; }
-  .item-title { font-size: 13px; font-weight: 600; line-height: 1.4; color: var(--text); margin-bottom: 3px; }
-  .item-meta { font-size: 11px; color: var(--text-dimmer); }
-  .item-badge {
-    display: inline-block; font-size: 10px; padding: 1px 5px;
-    border-radius: 3px; margin-left: 4px; vertical-align: middle;
-  }
-  .badge-read { background: #1e2d1e; color: var(--green); }
-  .badge-fail { background: #2d1e1e; color: #f87171; }
-  #empty-msg { padding: 24px 16px; color: var(--text-dim); font-size: 13px; text-align: center; }
-  #empty-msg.search-error { color: #f87171; }
-
-  /* Content pane */
-  #content-pane {
-    flex: 1; overflow-y: auto; padding: 40px 48px;
-    background: var(--bg);
-  }
-  #placeholder {
-    display: flex; align-items: center; justify-content: center;
-    height: 100%; color: var(--text-dimmer); font-size: 15px;
-  }
-
-  /* Article view */
-  #article-view { max-width: 720px; margin: 0 auto; }
-  #article-header { margin-bottom: 32px; }
-  #article-title { font-size: 28px; font-weight: 700; line-height: 1.3; margin-bottom: 12px; }
-  #article-meta { font-size: 13px; color: var(--text-dim); display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
-  #article-meta a { color: var(--accent); text-decoration: none; }
-  #article-meta a:hover { text-decoration: underline; }
-  #article-actions { display: flex; gap: 8px; align-items: center; }
-  #toggle-btn {
-    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text); font-size: 13px;
-    font-weight: 500; cursor: pointer; transition: all .15s;
-  }
-  #toggle-btn:hover { border-color: var(--accent); color: var(--accent); }
-  #toggle-btn.is-read { border-color: var(--green); color: var(--green); }
-  #delete-btn {
-    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text-dim); font-size: 13px;
-    font-weight: 500; cursor: pointer; transition: all .15s;
-  }
-  #delete-btn:hover { border-color: #f87171; color: #f87171; }
-  #refresh-btn {
-    padding: 7px 16px; border-radius: 6px; border: 1px solid var(--border);
-    background: var(--surface); color: var(--text-dim); font-size: 13px;
-    font-weight: 500; cursor: pointer; transition: all .15s;
-  }
-  #refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
-  #refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
-  .article-divider { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
-
-  /* Markdown body */
-  #article-body { font-size: 16px; line-height: 1.75; color: var(--text); }
-  #article-body h1,
-  #article-body h2,
-  #article-body h3,
-  #article-body h4 { font-weight: 700; line-height: 1.3; margin: 1.6em 0 0.5em; color: var(--text); }
-  #article-body h1 { font-size: 1.7em; }
-  #article-body h2 { font-size: 1.35em; }
-  #article-body h3 { font-size: 1.15em; }
-  #article-body h4 { font-size: 1em; }
-  #article-body p { margin: 0 0 1.1em; }
-  #article-body ul, #article-body ol { margin: 0 0 1.1em 1.5em; }
-  #article-body li { margin-bottom: 0.3em; }
-  #article-body a { color: var(--accent); text-decoration: none; }
-  #article-body a:hover { text-decoration: underline; }
-  #article-body blockquote {
-    border-left: 3px solid var(--accent); margin: 1em 0;
-    padding: 10px 16px; background: var(--surface); border-radius: 0 6px 6px 0;
-    color: var(--text-dim);
-  }
-  #article-body code {
-    font-family: "SF Mono", "Fira Code", Consolas, monospace;
-    font-size: 0.875em; background: var(--surface2);
-    padding: 2px 5px; border-radius: 4px;
-  }
-  #article-body pre {
-    background: var(--surface2); border: 1px solid var(--border);
-    border-radius: 8px; padding: 16px; overflow-x: auto;
-    margin: 0 0 1.2em;
-  }
-  #article-body pre code { background: none; padding: 0; font-size: 0.9em; }
-  #article-body img {
-    max-width: 100%; height: auto; border-radius: 8px;
-    margin: 12px 0; display: block;
-  }
-  #article-body table { border-collapse: collapse; width: 100%; margin: 0 0 1.2em; }
-  #article-body th, #article-body td {
-    border: 1px solid var(--border); padding: 8px 12px; text-align: left;
-  }
-  #article-body th { background: var(--surface2); font-weight: 600; }
-  #article-body hr { border: none; border-top: 1px solid var(--border); margin: 2em 0; }
-
-  /* Videos section */
-  #videos-section { margin-top: 32px; }
-  #videos-section h3 { font-size: 15px; font-weight: 600; color: var(--text-dim); margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .video-wrapper {
-    position: relative; padding-bottom: 56.25%; height: 0; overflow: hidden;
-    border-radius: 10px; margin-bottom: 20px; background: #000;
-  }
-  .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
-
-  /* Add URL bar */
-  #add-url-bar {
-    display: none; align-items: center; gap: 8px;
-    margin-left: auto; flex: 1; max-width: 480px;
-  }
-  #add-url-bar.open { display: flex; }
-  #add-url-input {
-    flex: 1; padding: 6px 10px; border-radius: 6px;
-    border: 1px solid var(--border); background: var(--bg);
-    color: var(--text); font-size: 13px; outline: none;
-  }
-  #add-url-input:focus { border-color: var(--accent); }
-  #add-url-submit {
-    padding: 6px 14px; border-radius: 6px; border: none;
-    background: var(--accent); color: #fff; font-size: 13px;
-    font-weight: 500; cursor: pointer; white-space: nowrap;
-    transition: background .15s;
-  }
-  #add-url-submit:hover:not(:disabled) { background: var(--accent-hover); }
-  #add-url-submit:disabled { opacity: 0.6; cursor: default; }
-  #add-url-cancel {
-    padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border);
-    background: transparent; color: var(--text-dim); font-size: 13px;
-    cursor: pointer; transition: all .15s;
-  }
-  #add-url-cancel:hover { border-color: var(--text-dim); color: var(--text); }
-  #add-btn {
-    margin-left: auto; padding: 6px 14px; border-radius: 6px;
-    border: 1px solid var(--border); background: transparent;
-    color: var(--text-dim); font-size: 13px; font-weight: 500;
-    cursor: pointer; transition: all .15s;
-  }
-  #add-btn:hover { border-color: var(--accent); color: var(--accent); }
-  #add-url-error { font-size: 12px; color: #f87171; white-space: nowrap; }
 
   /* Scrollbar */
   ::-webkit-scrollbar { width: 6px; }
@@ -357,22 +465,96 @@ _HTML = """<!DOCTYPE html>
     vertical-align: middle; margin-right: 8px;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
+
+  /* ---- Tablet and up: the two-pane layout ---- */
+  @media (min-width: 860px) {
+    #topnav { flex-wrap: nowrap; gap: 4px; height: 52px; padding: 0 20px; }
+    .nav-lead { margin-right: 12px; }
+    #tabbar { order: 2; flex-basis: auto; overflow: visible; }
+    .nav-actions { order: 3; }
+    .tab { min-height: 32px; padding: 6px 14px; }
+    .icon-btn { height: 34px; min-width: 34px; font-size: 14px; }
+    .btn-label { display: inline; }
+    body.reading #back-btn { display: none; }
+
+    #add-url-bar { order: 4; flex: 1; flex-basis: auto; flex-wrap: nowrap; max-width: 480px; margin-left: 8px; }
+    #add-url-input { padding: 6px 10px; font-size: 13px; }
+    #add-url-submit, #add-url-cancel { height: 32px; font-size: 13px; }
+    #add-url-error { flex-basis: auto; white-space: nowrap; }
+
+    #sidebar { width: var(--sidebar-w); border-right: 1px solid var(--border); }
+    body.reading #sidebar { display: block; }
+    #sidebar-search { padding: 12px; }
+    #sidebar-search input { padding: 7px 10px; font-size: 13px; }
+    .article-item { padding: 12px 14px; }
+    .article-item.active { padding-left: 11px; }
+    .item-title { font-size: 13px; }
+    .item-meta { font-size: 11px; }
+
+    #content-pane { display: block; padding: 40px 48px; }
+    #article-header { margin-bottom: 32px; }
+    #article-title { font-size: 28px; margin-bottom: 12px; }
+    #article-meta { gap: 12px; margin-bottom: 20px; }
+    #article-actions button { flex: 0 0 auto; min-height: 34px; padding: 0 16px; font-size: 13px; }
+    #article-body { font-size: 16px; line-height: 1.75; }
+    #article-body h1 { font-size: 1.7em; }
+    #article-body h2 { font-size: 1.35em; }
+    .article-divider { margin: 28px 0; }
+
+    .overlay { align-items: flex-start; justify-content: center; padding: 48px 20px; overflow-y: auto; }
+    .modal {
+      width: 100%; max-width: 620px; height: auto; max-height: calc(100vh - 96px);
+      border: 1px solid var(--border); border-radius: 12px;
+      box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+    }
+    .modal-header { padding: 18px 22px; }
+    .modal-body { padding: 22px; }
+    .modal-footer { padding: 16px 22px; }
+    .modal-footer button { flex: 0 0 auto; min-height: 38px; }
+    .modal-footer .spacer { flex: 1 1 auto; }
+
+    .stat-tiles { grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 26px; }
+    .stat-value { font-size: 26px; }
+    .nav-arrow { width: 26px; height: 26px; font-size: 15px; }
+    .period-btn { font-size: 11px; padding: 3px 10px; }
+    .rank-row { font-size: 13px; padding: 6px 0; }
+    .tag-chip { font-size: 12px; padding: 4px 10px; }
+  }
 </style>
 </head>
 <body>
 <div id="shell">
   <nav id="topnav">
-    <span class="brand">ril</span>
-    <button class="tab active" data-filter="unread" onclick="switchTab(this)">Unread <span class="tab-count" id="count-unread"></span></button>
-    <button class="tab" data-filter="all" onclick="switchTab(this)">All <span class="tab-count" id="count-all"></span></button>
-    <button class="tab" data-filter="read" onclick="switchTab(this)">Read <span class="tab-count" id="count-read"></span></button>
-    <button id="stats-btn" class="tab" onclick="openStats()">📊 Stats</button>
-    <button id="add-btn" onclick="openAddUrl()">+ Add URL</button>
+    <div class="nav-lead">
+      <button id="back-btn" class="icon-btn" onclick="goBack()" aria-label="Back to list">←</button>
+      <span class="brand">ril</span>
+    </div>
+    <div class="nav-actions">
+      <button id="add-btn" class="icon-btn" onclick="openAddUrl()" aria-label="Add URL">+<span class="btn-label">Add URL</span></button>
+      <div id="menu-wrap">
+        <button id="menu-btn" class="icon-btn" onclick="toggleMenu(event)" aria-label="More actions" aria-haspopup="true" aria-expanded="false">⋯</button>
+        <div id="menu" role="menu">
+          <button class="menu-item" role="menuitem" onclick="openStats()">📊 Statistics</button>
+          <button class="menu-item" role="menuitem" onclick="exportData()">⬇ Export backup (.zip)</button>
+          <div class="menu-sep"></div>
+          <button class="menu-item danger" role="menuitem" onclick="pickImportFile()">↺ Import backup…</button>
+        </div>
+      </div>
+    </div>
+    <div id="tabbar" role="tablist">
+      <button class="tab active" data-filter="unread" onclick="switchTab(this)">Unread <span class="tab-count" id="count-unread"></span></button>
+      <button class="tab" data-filter="all" onclick="switchTab(this)">All <span class="tab-count" id="count-all"></span></button>
+      <button class="tab" data-filter="read" onclick="switchTab(this)">Read <span class="tab-count" id="count-read"></span></button>
+    </div>
     <div id="add-url-bar">
       <input type="url" id="add-url-input" placeholder="https://…" onkeydown="addUrlKey(event)" />
-      <span id="add-url-error"></span>
       <button id="add-url-submit" onclick="submitAddUrl()">Save</button>
       <button id="add-url-cancel" onclick="closeAddUrl()">Cancel</button>
+      <span id="add-url-error"></span>
     </div>
   </nav>
   <div id="main">
@@ -407,13 +589,26 @@ _HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<div id="stats-overlay" onclick="maybeCloseStats(event)">
-  <div id="stats-modal">
-    <div id="stats-modal-header">
+<input type="file" id="import-file" accept=".zip,application/zip" hidden onchange="onImportFile(event)" />
+
+<div id="stats-overlay" class="overlay" onclick="maybeCloseOverlay(event, 'stats-overlay')">
+  <div class="modal">
+    <div class="modal-header">
       <h2>Statistics</h2>
-      <button id="stats-close" onclick="closeStats()">✕</button>
+      <button class="modal-close" onclick="closeStats()" aria-label="Close">✕</button>
     </div>
-    <div id="stats-content"></div>
+    <div class="modal-body" id="stats-content"></div>
+  </div>
+</div>
+
+<div id="import-overlay" class="overlay" onclick="maybeCloseOverlay(event, 'import-overlay')">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Import backup</h2>
+      <button class="modal-close" onclick="closeImport()" aria-label="Close">✕</button>
+    </div>
+    <div class="modal-body" id="import-content"></div>
+    <div class="modal-footer" id="import-footer"></div>
   </div>
 </div>
 
@@ -504,16 +699,30 @@ function renderList() {
   }).join('');
 }
 
+function isNarrow() {
+  return window.matchMedia('(max-width: 859.98px)').matches;
+}
+
 function switchTab(btn) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   currentFilter = btn.dataset.filter;
+  // On a single-column screen the reader covers the list, so switching tabs
+  // has to reveal the list it just changed.
+  if (isNarrow() && document.body.classList.contains('reading')) goBack();
   loadArticles();
 }
 
-async function openArticle(id) {
+async function openArticle(id, fromHistory) {
   currentArticleId = id;
   renderList();
+
+  // On narrow screens the reader replaces the list, so the article becomes a
+  // history entry and the device back button returns to the list.
+  document.body.classList.add('reading');
+  if (!fromHistory) {
+    history.pushState({ articleId: id }, '');
+  }
 
   document.getElementById('placeholder').style.display = 'none';
   const view = document.getElementById('article-view');
@@ -663,15 +872,29 @@ async function refreshArticle() {
 
 function showPlaceholder() {
   currentArticleId = null;
+  document.body.classList.remove('reading');
   document.getElementById('placeholder').style.display = 'flex';
   document.getElementById('article-view').style.display = 'none';
+  renderList();
 }
+
+function goBack() {
+  if (history.state && history.state.articleId) history.back();
+  else showPlaceholder();
+}
+
+window.addEventListener('popstate', e => {
+  const id = e.state && e.state.articleId;
+  if (id && allArticles.find(a => a.id === id)) openArticle(id, true);
+  else showPlaceholder();
+});
 
 function escHtml(str) {
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 function openAddUrl() {
+  closeMenu();
   document.getElementById('add-btn').style.display = 'none';
   document.getElementById('add-url-bar').classList.add('open');
   document.getElementById('add-url-error').textContent = '';
@@ -797,6 +1020,7 @@ async function loadStats() {
 }
 
 async function openStats() {
+  closeMenu();
   const overlay = document.getElementById('stats-overlay');
   const content = document.getElementById('stats-content');
   overlay.classList.add('open');
@@ -810,8 +1034,162 @@ function closeStats() {
   document.getElementById('stats-overlay').classList.remove('open');
 }
 
-function maybeCloseStats(e) {
-  if (e.target.id === 'stats-overlay') closeStats();
+function maybeCloseOverlay(e, id) {
+  // Only a tap on the backdrop itself closes; on small screens the sheet fills
+  // the viewport so this never fires there.
+  if (e.target.id === id) {
+    if (id === 'stats-overlay') closeStats();
+    else closeImport();
+  }
+}
+
+function toggleMenu(e) {
+  e.stopPropagation();
+  const menu = document.getElementById('menu');
+  const open = menu.classList.toggle('open');
+  document.getElementById('menu-btn').setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function closeMenu() {
+  document.getElementById('menu').classList.remove('open');
+  document.getElementById('menu-btn').setAttribute('aria-expanded', 'false');
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('#menu-wrap')) closeMenu();
+});
+
+function exportData() {
+  closeMenu();
+  // Let the browser handle the download so large archives never buffer in JS.
+  window.location.href = '/api/export';
+}
+
+let pendingImportFile = null;
+
+function pickImportFile() {
+  closeMenu();
+  const input = document.getElementById('import-file');
+  input.value = '';
+  input.click();
+}
+
+async function onImportFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  pendingImportFile = file;
+  openImport();
+  setImportBody('<div class="stats-loading"><span class="spinner"></span>Reading archive…</div>', '');
+
+  const result = await uploadImport(file, true);
+  if (result.error) {
+    showImportError(result.error);
+    return;
+  }
+  renderImportPreview(file, result.data);
+}
+
+async function uploadImport(file, dryRun) {
+  try {
+    const res = await fetch(`/api/import?dry_run=${dryRun}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/zip', 'X-RIL-Confirm': 'replace-all' },
+      body: file,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { error: data.detail || `Import failed (HTTP ${res.status}).` };
+    return { data };
+  } catch (err) {
+    return { error: 'Could not reach the server. Is `ril serve` still running?' };
+  }
+}
+
+function openImport() {
+  document.getElementById('import-overlay').classList.add('open');
+}
+
+function closeImport() {
+  document.getElementById('import-overlay').classList.remove('open');
+  pendingImportFile = null;
+}
+
+function setImportBody(bodyHtml, footerHtml) {
+  document.getElementById('import-content').innerHTML = bodyHtml;
+  document.getElementById('import-footer').innerHTML = footerHtml;
+}
+
+function showImportError(message) {
+  setImportBody(
+    `<div class="warn-box">${escHtml(message)}</div>`,
+    '<button onclick="closeImport()">Close</button>'
+  );
+}
+
+function summaryRow(label, value, cls) {
+  return `<div class="summary-row"><span class="k">${escHtml(label)}</span>` +
+    `<span class="v ${cls || ''}">${escHtml(String(value))}</span></div>`;
+}
+
+function renderImportPreview(file, s) {
+  let archiveRows = summaryRow('Articles in the archive', s.article_count) +
+    summaryRow('Markdown files', s.file_count);
+  if (s.missing_files) archiveRows += summaryRow('Indexed articles with no file', s.missing_files, 'warn');
+  if (s.orphan_files) archiveRows += summaryRow('Files not listed in the index', s.orphan_files, 'warn');
+  if (s.skipped_entries) archiveRows += summaryRow('Unrelated entries (ignored)', s.skipped_entries, 'warn');
+
+  const body = `
+    <div class="summary-title">Archive</div>
+    <div class="file-name">${escHtml(file.name)}</div>
+    ${archiveRows}
+    <div class="summary-title">Your library right now</div>
+    ${summaryRow('Articles that will be deleted', s.replaced_articles, s.replaced_articles ? 'danger' : '')}
+    <div class="warn-box">
+      This replaces your whole library. Everything not in the archive is removed —
+      it is not merged with what you have now.
+    </div>
+    <div class="note-box">
+      A snapshot of your current data is saved next to your data folder first, so you
+      can undo this with <code>ril import backup &lt;snapshot&gt;</code>.
+    </div>`;
+
+  const footer = '<button onclick="closeImport()">Cancel</button>' +
+    '<button class="btn-danger" id="import-confirm" onclick="confirmImport()">Replace all data</button>';
+  setImportBody(body, footer);
+}
+
+async function confirmImport() {
+  if (!pendingImportFile) return;
+  const file = pendingImportFile;
+  const btn = document.getElementById('import-confirm');
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>Restoring…';
+  }
+  document.querySelectorAll('#import-footer button').forEach(b => { b.disabled = true; });
+
+  const result = await uploadImport(file, false);
+  if (result.error) {
+    showImportError(result.error);
+    return;
+  }
+
+  const s = result.data;
+  const snapshot = s.snapshot
+    ? `<div class="note-box">Your previous data was saved as <span class="file-name">${escHtml(s.snapshot)}</span>, next to your data folder.</div>`
+    : '';
+  setImportBody(
+    `<div class="summary-title">Done</div>
+     ${summaryRow('Articles restored', s.article_count)}
+     ${summaryRow('Articles replaced', s.replaced_articles)}
+     ${snapshot}`,
+    '<button onclick="closeImport()">Close</button>'
+  );
+
+  pendingImportFile = null;
+  statsCache = null;
+  showPlaceholder();
+  await loadArticles();
+  loadStats();
 }
 
 function renderStats(s) {
@@ -949,9 +1327,13 @@ function hideChartTip() {
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && document.getElementById('stats-overlay').classList.contains('open')) closeStats();
+  if (e.key !== 'Escape') return;
+  if (document.getElementById('menu').classList.contains('open')) { closeMenu(); return; }
+  if (document.getElementById('import-overlay').classList.contains('open')) { closeImport(); return; }
+  if (document.getElementById('stats-overlay').classList.contains('open')) closeStats();
 });
 
+history.replaceState({ articleId: null }, '');
 loadArticles();
 loadStats();
 </script>
@@ -1149,6 +1531,33 @@ def _compute_stats(index: Index) -> dict:
     }
 
 
+def _summary_payload(result) -> dict:
+    """Shape a RestoreResult for the web UI (counts only, no file listings)."""
+    summary = result.summary
+    return {
+        "article_count": summary.article_count,
+        "file_count": summary.file_count,
+        "missing_files": len(summary.missing_files),
+        "orphan_files": len(summary.orphan_files),
+        "skipped_entries": len(summary.skipped_entries),
+        "replaced_articles": result.replaced_articles,
+        "dry_run": result.dry_run,
+        "snapshot": result.snapshot_path.name if result.snapshot_path else None,
+    }
+
+
+async def _spool_upload(request: Request, destination: Path) -> int:
+    """Stream the request body to disk so a large archive never sits in memory."""
+    written = 0
+    with destination.open("wb") as fh:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > _MAX_IMPORT_BYTES:
+                raise HTTPException(status_code=413, detail="Archive is too large.")
+            fh.write(chunk)
+    return written
+
+
 def build_app(data_folder: Path) -> FastAPI:
     app = FastAPI(title="Read It Later", docs_url=None, redoc_url=None)
 
@@ -1202,7 +1611,10 @@ def build_app(data_folder: Path) -> FastAPI:
         article = index.find_by_id(article_id)
         if article is None:
             raise HTTPException(status_code=404, detail="Article not found")
-        path = get_article_path(data_folder, article)
+        try:
+            path = get_article_path(data_folder, article)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not path.exists():
             raise HTTPException(status_code=404, detail="Article file not found")
         raw = path.read_text(encoding="utf-8")
@@ -1227,7 +1639,10 @@ def build_app(data_folder: Path) -> FastAPI:
         article = index.find_by_id(article_id)
         if article is None:
             raise HTTPException(status_code=404, detail="Article not found")
-        delete_article(data_folder, article)
+        try:
+            delete_article(data_folder, article)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/articles/{article_id}/refresh")
     async def refresh_article_endpoint(article_id: str) -> dict:
@@ -1251,5 +1666,49 @@ def build_app(data_folder: Path) -> FastAPI:
             article.mark_read()
         update_article(data_folder, article)
         return article.model_dump(mode="json")
+
+    @app.get("/api/export")
+    async def export_archive() -> FileResponse:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ril-export-"))
+        filename = export_filename()
+        zip_path = tmp_dir / filename
+        try:
+            await asyncio.to_thread(create_archive, data_folder, zip_path)
+        except Exception as exc:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise HTTPException(status_code=500, detail=f"Could not build export: {exc}") from exc
+        return FileResponse(
+            zip_path,
+            media_type="application/zip",
+            filename=filename,
+            background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
+        )
+
+    @app.post("/api/import")
+    async def import_archive(request: Request, dry_run: bool = True) -> dict:
+        """Replace the whole library with an uploaded backup zip.
+
+        Defaults to `dry_run=true`: the client previews the archive first, then
+        repeats the upload with `dry_run=false` once the user has confirmed.
+        """
+        if request.headers.get(_IMPORT_CONFIRM_HEADER, "") != _IMPORT_CONFIRM_VALUE:
+            raise HTTPException(status_code=403, detail="Missing import confirmation header.")
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="ril-import-"))
+        upload = tmp_dir / "upload.zip"
+        try:
+            size = await _spool_upload(request, upload)
+            if size == 0:
+                raise HTTPException(status_code=422, detail="No archive was uploaded.")
+            try:
+                result = await asyncio.to_thread(
+                    restore_archive, data_folder, upload, dry_run, True, "the uploaded file"
+                )
+            except ArchiveError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return _summary_payload(result)
 
     return app
