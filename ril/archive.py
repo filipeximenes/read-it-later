@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterator, Optional
 
 from ril.models import Index
-from ril.storage import load_index
+from ril.storage import is_internal_file, load_index
 
 INDEX_NAME = "index.json"
 ARTICLES_DIR = "articles"
@@ -63,6 +63,10 @@ def create_archive(data_folder: Path, zip_path: Path) -> Path:
             if not file.is_file() or file.is_symlink():
                 continue
             if file.resolve() == target:
+                continue
+            # The lock and any half-written index belong to the running
+            # process, not to the library.
+            if is_internal_file(file.name):
                 continue
             zf.write(file, file.relative_to(data_folder))
     return zip_path
@@ -192,12 +196,12 @@ def inspect_archive(zip_path: Path, label: Optional[str] = None) -> ArchiveSumma
     summary.skipped_entries = sorted(
         name for name in members if name != INDEX_NAME and name not in article_files
     )
-    summary.article_count = len(index.articles)
+    summary.article_count = len(index.live)
     summary.file_count = len(article_files)
 
-    indexed = {f"{ARTICLES_DIR}/{a.filename}" for a in index.articles}
+    indexed = {f"{ARTICLES_DIR}/{a.filename}" for a in index.live}
     summary.missing_files = sorted(
-        a.filename for a in index.articles if f"{ARTICLES_DIR}/{a.filename}" not in article_files
+        a.filename for a in index.live if f"{ARTICLES_DIR}/{a.filename}" not in article_files
     )
     summary.orphan_files = sorted(
         Path(name).name for name in article_files if name not in indexed
@@ -220,7 +224,7 @@ def restore_archive(
     """
     data_folder = Path(data_folder)
     summary = inspect_archive(zip_path, label)
-    replaced = len(load_index(data_folder).articles)
+    replaced = len(load_index(data_folder).live)
 
     if dry_run:
         return RestoreResult(summary=summary, replaced_articles=replaced, dry_run=True)

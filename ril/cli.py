@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -20,9 +21,27 @@ from ril.archive import (
     export_filename,
     restore_archive,
 )
-from ril.config import get_backup_folder, get_data_folder, save_backup_folder
+from ril.config import (
+    get_backup_folder,
+    get_data_folder,
+    get_sync_url,
+    save_backup_folder,
+    save_sync_url,
+)
 from ril.extractor import fetch_and_extract
 from ril.models import Article
+from ril.remote import (
+    CREDENTIALS_FILE,
+    Remote,
+    RemoteClient,
+    RemoteError,
+    RemoteNotConfiguredError,
+    RemoteStatus,
+    forget_token,
+    load_remote,
+    normalise_url,
+    save_token,
+)
 from ril.storage import (
     delete_article,
     get_article_path,
@@ -31,6 +50,7 @@ from ril.storage import (
     save_article,
     update_article,
 )
+from ril.sync import sync_is_stale, sync_once
 
 app = typer.Typer(
     name="ril",
@@ -42,6 +62,9 @@ err_console = Console(stderr=True)
 
 import_app = typer.Typer(help="Import from external sources.", no_args_is_help=True)
 app.add_typer(import_app, name="import")
+
+sync_app = typer.Typer(help="Sync with a hosted copy of this library.", no_args_is_help=True)
+app.add_typer(sync_app, name="sync")
 
 
 def _data_folder() -> Path:
@@ -60,6 +83,7 @@ def _resolve_article(data_folder: Path, article_id: str) -> Article:
 # ---------------------------------------------------------------------------
 # add
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def add(
@@ -95,11 +119,13 @@ def add(
         f"[bold green]Saved[/bold green] ({status_label}) "
         f"[bold]{article.title}[/bold]  [dim](id: {article.id})[/dim]"
     )
+    _sync_quietly(data_folder)
 
 
 # ---------------------------------------------------------------------------
 # list
 # ---------------------------------------------------------------------------
+
 
 @app.command(name="list")
 def list_articles(
@@ -110,22 +136,25 @@ def list_articles(
 ):
     """List saved articles. Shows only unread articles by default."""
     data_folder = _data_folder()
+    # Reading is worth a pull, but not on every single command.
+    if sync_is_stale(data_folder):
+        _sync_quietly(data_folder)
     index = load_index(data_folder)
 
     def _naive(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None)
 
     if all_articles:
-        articles = sorted(index.articles, key=lambda a: _naive(a.saved_at), reverse=True)
+        articles = sorted(index.live, key=lambda a: _naive(a.saved_at), reverse=True)
     elif read:
         articles = sorted(
-            (a for a in index.articles if a.read),
+            (a for a in index.live if a.read),
             key=lambda a: _naive(a.read_at or a.saved_at),
             reverse=True,
         )
     else:
         articles = sorted(
-            (a for a in index.articles if not a.read),
+            (a for a in index.live if not a.read),
             key=lambda a: _naive(a.saved_at),
         )
 
@@ -166,14 +195,15 @@ def list_articles(
         table.add_row(*row)
 
     console.print(table)
-    total = len(index.articles)
-    unread_count = sum(1 for a in index.articles if not a.read)
+    total = len(index.live)
+    unread_count = sum(1 for a in index.live if not a.read)
     console.print(f"[dim]{total} article(s)  •  {unread_count} unread[/dim]")
 
 
 # ---------------------------------------------------------------------------
 # open
 # ---------------------------------------------------------------------------
+
 
 @app.command(name="open")
 def open_article(
@@ -196,11 +226,13 @@ def open_article(
         article.mark_read()
         update_article(data_folder, article)
         console.print(f"[green]Marked as read:[/green] {article.title}")
+    _sync_quietly(data_folder)
 
 
 # ---------------------------------------------------------------------------
 # mark
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def mark(
@@ -225,6 +257,7 @@ def mark(
 # delete
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def delete(
     article_id: str = typer.Argument(..., help="Article ID (from ril list)"),
@@ -246,11 +279,13 @@ def delete(
         err_console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
     console.print(f"[red]Deleted:[/red] {article.title}")
+    _sync_quietly(data_folder)
 
 
 # ---------------------------------------------------------------------------
 # refresh
 # ---------------------------------------------------------------------------
+
 
 @app.command()
 def refresh(
@@ -274,6 +309,7 @@ def refresh(
         f"[bold green]Refreshed[/bold green] "
         f"[bold]{article.title}[/bold]  [dim](id: {article.id})[/dim]"
     )
+    _sync_quietly(data_folder)
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +347,7 @@ def _write_export(output: Optional[Path]) -> None:
         create_archive(data_folder, zip_path)
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
-    article_count = len(load_index(data_folder).articles)
+    article_count = len(load_index(data_folder).live)
     console.print(
         f"[bold green]Exported[/bold green] {article_count} article(s) "
         f"[dim]({size_mb:.1f} MB)[/dim] \u2192 {zip_path}"
@@ -401,9 +437,7 @@ def import_pocket(
                         )
 
                     extracted = fetch_and_extract(url)
-                    extracted = pocket.apply_pocket_title_fallback(
-                        row.get("title"), url, extracted
-                    )
+                    extracted = pocket.apply_pocket_title_fallback(row.get("title"), url, extracted)
 
                     save_article(
                         data_folder,
@@ -515,6 +549,7 @@ def import_backup(
 # serve
 # ---------------------------------------------------------------------------
 
+
 @app.command()
 def serve(
     port: int = typer.Option(8484, "--port", "-p", help="Port to listen on"),
@@ -539,6 +574,130 @@ def serve(
         "[dim](Ctrl+C to stop)[/dim]"
     )
     uvicorn.run(fastapi_app, host="127.0.0.1", port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
+# sync
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def _remote_failure_exits():
+    """Turn any failure to reach the remote into a message and a non-zero exit."""
+    try:
+        yield
+    except RemoteError as exc:
+        err_console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+
+
+@sync_app.command("login")
+def sync_login(
+    url: Optional[str] = typer.Option(
+        None, "--url", help="Base URL of the hosted instance, e.g. https://example.com/ril"
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        help="Sync token. Omit to be prompted without echo, which keeps it out of shell history.",
+    ),
+):
+    """Store the credential for a hosted instance, after checking it works."""
+    raw_url = url or get_sync_url() or typer.prompt("Base URL of the hosted instance")
+    # Checked before the token is asked for, so a bad URL is not found out late.
+    with _remote_failure_exits():
+        checked_url = normalise_url(raw_url)
+
+    secret = (token or typer.prompt("Sync token", hide_input=True)).strip()
+    if not secret:
+        err_console.print("[red]A sync token is required.[/red]")
+        raise typer.Exit(1)
+
+    # Checked before anything is written, so a wrong credential is never stored.
+    console.print(f"[dim]Checking {checked_url} …[/dim]")
+    with _remote_failure_exits(), RemoteClient(Remote(checked_url, secret)) as client:
+        status = client.probe()
+
+    # Every status means the gateway accepted the token, so the credential is
+    # worth keeping even when the library behind it is down or out of date.
+    save_sync_url(checked_url)
+    save_token(secret)
+    console.print(f"[green]Signed in to[/green] {checked_url}")
+    if status is not RemoteStatus.READY:
+        console.print(f"[yellow]Note:[/yellow] {status.value}.")
+    console.print(f"[dim]Token stored in {CREDENTIALS_FILE} (readable by you only).[/dim]")
+
+
+@sync_app.command("status")
+def sync_status():
+    """Show where sync points and whether the stored credential still works."""
+    with _remote_failure_exits():
+        remote = load_remote()
+        console.print(f"[bold]Remote:[/bold] {remote.url}")
+        with RemoteClient(remote) as client:
+            status = client.probe()
+    console.print(f"[green]Authorised[/green] — {status.value}")
+
+
+@sync_app.command("run")
+def sync_run(
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would be sent, and change nothing."
+    ),
+):
+    """Exchange changes with the hosted copy."""
+    data_folder = _data_folder()
+    with _remote_failure_exits():
+        remote = load_remote()
+        with RemoteClient(remote) as client:
+            report = sync_once(data_folder, client, dry_run=dry_run)
+
+    if report.dry_run:
+        console.print(f"[dim]Would send {report.sent} record(s). Nothing was changed.[/dim]")
+        return
+    if report.quiet:
+        console.print("[dim]Already up to date.[/dim]")
+        return
+    console.print(
+        f"[green]Synced[/green] — sent {report.sent}, received {report.received}, "
+        f"bodies out {report.bodies_sent}, bodies in {report.bodies_received}"
+    )
+
+
+def _sync_quietly(data_folder: Path) -> None:
+    """Sync in the background of another command, and never get in its way.
+
+    A command that saved or changed something has already succeeded by the
+    time this runs. Sync is how that reaches the other side eventually, so a
+    server that is asleep, slow or unreachable must not turn a working command
+    into a failing one. The cursors are only moved on success, so whatever was
+    missed goes with the next sync.
+    """
+    try:
+        remote = load_remote()
+    except RemoteNotConfiguredError:
+        return
+    except RemoteError as exc:
+        err_console.print(f"[dim]Sync skipped: {exc}[/dim]")
+        return
+
+    try:
+        with RemoteClient(remote) as client:
+            report = sync_once(data_folder, client)
+    except RemoteError as exc:
+        err_console.print(f"[dim]Sync skipped: {exc}[/dim]")
+        return
+    if not report.quiet:
+        console.print(f"[dim]Synced — sent {report.sent}, received {report.received}.[/dim]")
+
+
+@sync_app.command("logout")
+def sync_logout():
+    """Forget the stored sync token. The URL setting is left in place."""
+    if forget_token():
+        console.print("[green]Sync token removed.[/green]")
+    else:
+        console.print("[dim]No sync token was stored.[/dim]")
 
 
 if __name__ == "__main__":

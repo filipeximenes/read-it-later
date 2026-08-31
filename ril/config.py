@@ -19,12 +19,21 @@ def load_config() -> Optional[dict]:
         return json.load(f)
 
 
-def save_config(data_folder: Path) -> None:
+def _save_setting(key: str, value: str) -> None:
+    """Update one setting, leaving the rest of the file alone.
+
+    Only non-secret settings belong here. The sync token is written by
+    `ril.remote` to its own file, which is readable by its owner only.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     existing = load_config() or {}
-    existing["data_folder"] = str(data_folder)
+    existing[key] = value
     with CONFIG_FILE.open("w") as f:
         json.dump(existing, f, indent=2)
+
+
+def save_config(data_folder: Path) -> None:
+    _save_setting("data_folder", str(data_folder))
 
 
 def get_backup_folder() -> Optional[Path]:
@@ -35,11 +44,22 @@ def get_backup_folder() -> Optional[Path]:
 
 
 def save_backup_folder(folder: Path) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    existing = load_config() or {}
-    existing["backup_folder"] = str(folder)
-    with CONFIG_FILE.open("w") as f:
-        json.dump(existing, f, indent=2)
+    _save_setting("backup_folder", str(folder))
+
+
+def get_sync_url() -> Optional[str]:
+    """Base URL of the hosted instance. `RIL_SYNC_URL` wins when set."""
+    override = (os.environ.get("RIL_SYNC_URL") or "").strip()
+    if override:
+        return override
+    config = load_config()
+    if config and config.get("sync_url"):
+        return str(config["sync_url"])
+    return None
+
+
+def save_sync_url(url: str) -> None:
+    _save_setting("sync_url", url)
 
 
 def get_data_folder() -> Path:

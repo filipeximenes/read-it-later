@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from ril.archive import (
@@ -26,11 +26,15 @@ from ril.models import Article, Index
 from ril.storage import (
     delete_article,
     get_article_path,
+    index_transaction,
     load_index,
+    read_body,
     refresh_article,
     save_article,
     update_article,
+    write_body,
 )
+from ril.sync import SYNC_PROTOCOL, apply_incoming
 
 # Import replaces the whole library, so it is guarded by a header a cross-origin
 # page cannot send without a CORS preflight that this app never grants.
@@ -49,6 +53,17 @@ class _SearchUnavailableError(RuntimeError):
 
 class _AddRequest(BaseModel):
     url: str
+
+
+class _SyncRequest(BaseModel):
+    """One round of sync: what the other side changed, and where it left off."""
+
+    since: Optional[datetime] = None
+    articles: list[Article] = Field(default_factory=list)
+
+
+class _BodyRequest(BaseModel):
+    markdown: str
 
 _YT_WATCH_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?.*?v=([A-Za-z0-9_-]+)")
 _YT_SHORT_RE = re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]+)")
@@ -1427,14 +1442,14 @@ def _naive(dt: datetime) -> datetime:
 def _tab_articles(filter_name: str, index: Index) -> list[Article]:
     if filter_name == "read":
         return sorted(
-            (a for a in index.articles if a.read),
+            (a for a in index.live if a.read),
             key=lambda a: _naive(a.read_at or a.saved_at),
             reverse=True,
         )
     if filter_name == "all":
-        return sorted(index.articles, key=lambda a: _naive(a.saved_at), reverse=True)
+        return sorted(index.live, key=lambda a: _naive(a.saved_at), reverse=True)
     return sorted(
-        (a for a in index.articles if not a.read),
+        (a for a in index.live if not a.read),
         key=lambda a: _naive(a.saved_at),
     )
 
@@ -1479,7 +1494,7 @@ def _bucket_activity(
 
 
 def _compute_stats(index: Index) -> dict:
-    articles = index.articles
+    articles = index.live
     total = len(articles)
     read = sum(1 for a in articles if a.read)
     failed = sum(1 for a in articles if a.fetch_failed)
@@ -1596,12 +1611,12 @@ def build_app(data_folder: Path) -> FastAPI:
         offset = max(0, min(offset, 5200))
         index = load_index(data_folder)
         now = datetime.utcnow()
-        buckets = _bucket_activity(index.articles, now, unit, count, offset)
+        buckets = _bucket_activity(index.live, now, unit, count, offset)
         oldest = offset + count
         has_older = any(
             _bucket_index(_naive(a.saved_at), now, unit) >= oldest
             or (a.read_at is not None and _bucket_index(_naive(a.read_at), now, unit) >= oldest)
-            for a in index.articles
+            for a in index.live
         )
         return {"buckets": buckets, "has_older": has_older, "has_newer": offset > 0}
 
@@ -1666,6 +1681,63 @@ def build_app(data_folder: Path) -> FastAPI:
             article.mark_read()
         update_article(data_folder, article)
         return article.model_dump(mode="json")
+
+    # -- sync ---------------------------------------------------------------
+
+    @app.get("/api/sync")
+    async def sync_handshake() -> dict:
+        """Say that this instance speaks sync, and which version of it.
+
+        Side-effect free on purpose: it is what a client calls to check its
+        credential, and checking a credential must not change anything.
+        """
+        return {"protocol": SYNC_PROTOCOL}
+
+    @app.post("/api/sync")
+    async def sync_endpoint(body: _SyncRequest) -> dict:
+        """Merge the other side's changes and hand back what it has not seen."""
+        outcome = await asyncio.to_thread(
+            apply_incoming, data_folder, body.articles, body.since
+        )
+        return {
+            "now": outcome.now.isoformat(),
+            "articles": [a.model_dump(mode="json") for a in outcome.outgoing],
+            # Bodies this side lost the merge on, so the other side should
+            # send them. Working it out here saves a round trip.
+            "want_bodies": sorted(outcome.wanted_bodies),
+        }
+
+    @app.get("/api/sync/body/{article_id}")
+    async def read_sync_body(article_id: str) -> dict:
+        index = load_index(data_folder)
+        article = index.by_id().get(article_id)
+        if article is None or article.deleted:
+            raise HTTPException(status_code=404, detail="Article not found")
+        try:
+            markdown = await asyncio.to_thread(read_body, data_folder, article)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"markdown": markdown}
+
+    @app.put("/api/sync/body/{article_id}")
+    async def write_sync_body(article_id: str, body: _BodyRequest) -> dict:
+        """Take a body the other side fetched, for a record already merged."""
+
+        def _store() -> Optional[str]:
+            with index_transaction(data_folder) as index:
+                article = index.by_id().get(article_id)
+                if article is None or article.deleted:
+                    return None
+                write_body(data_folder, article, body.markdown)
+                return article.body_sha256
+
+        try:
+            digest = await asyncio.to_thread(_store)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if digest is None:
+            raise HTTPException(status_code=404, detail="Article not found")
+        return {"body_sha256": digest}
 
     @app.get("/api/export")
     async def export_archive() -> FileResponse:

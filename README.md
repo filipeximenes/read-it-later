@@ -196,6 +196,81 @@ Filenames follow the pattern `{UTC_TIMESTAMP}_{ID}_{TITLE_SLUG}.md`, which ensur
 4. The article is saved as a `.md` file and an entry is added to `index.json`
 5. Each article's ID is the first 8 hex characters of the SHA-256 hash of its URL — stable, short, and guaranteed unique per URL
 
+## Syncing with a hosted copy
+
+`ril` can point at a hosted instance of itself. The command line stays the
+place articles are fetched, because it runs where the browser cookies are and
+can get past a paywall; the hosted copy is for reading on other devices.
+
+Sign in once, with a token the server issues:
+
+```bash
+ril sync login --url https://example.com/ril
+# prompts for the token without echoing it
+ril sync status         # where it points, and whether the token still works
+ril sync run            # exchange changes now
+ril sync run --dry-run  # show what would be sent, change nothing
+ril sync logout         # forget the token
+```
+
+### When it runs
+
+`add`, `mark`, `delete` and `refresh` sync once when they finish. One exchange
+carries both directions, so that single call pushes what you just did and pulls
+whatever the hosted copy has. `list` syncs first, but only if the last one was
+over five minutes ago.
+
+**Sync never makes a command fail.** The article is already saved by the time
+it runs, so a server that is asleep, slow or unreachable prints one dim line
+and nothing more. The cursors only move on success, so whatever was missed goes
+with the next sync — a laptop that was offline for a month catches up in one go.
+
+### How changes are reconciled
+
+Article ids are a digest of the URL, so both sides give the same article the
+same id without arranging anything. A record is then merged in three parts,
+each settling on its own:
+
+| Part | Rule |
+| --- | --- |
+| Body and metadata | A fetched body beats a paywall stub, however new the stub is. Between two real bodies, the newer wins |
+| Read or unread | The newer change wins |
+| Deleted or not | The newer change wins, so saving a URL again undoes an older delete |
+
+The first rule is the point of the whole arrangement. The command line runs
+where your browser cookies are, so its copy of a paywalled article is the real
+one, and the hosted copy's later, emptier attempt must not overwrite it. If the
+server saved a stub, `ril refresh <id>` on your machine replaces it everywhere.
+
+Both sides run identical rules, so the order of syncs does not matter and
+neither does how long one side was offline. The rules are commutative,
+idempotent and associative, and the tests check that over thousands of
+randomised pairs.
+
+**Deletes leave a tombstone** — the row stays, with the body file removed. A row
+that simply vanished cannot be told apart from one the other side has not sent
+yet, and would come back on the next sync. Tombstones are never listed, counted
+or opened.
+
+The token is **scoped**: it opens the hosted instance's sync endpoints and
+nothing else — not the hub it sits behind, and not the import endpoint that
+would replace the whole data folder. Getting one is a server-side step.
+
+`ril sync login` checks the credential against the server before storing it, so
+a wrong token is never written to disk. It still stores a token the server
+accepted even when the library behind the gateway is down or too old to sync —
+those say nothing about whether the credential is good.
+
+Two rules worth knowing:
+
+- **https is required.** A bearer token sent over plain `http` can be read in
+  transit, so anything else is refused. `http://localhost` is allowed, because
+  it never leaves the machine.
+- **The token is not kept with the settings.** It goes in
+  `~/.config/ril/credentials.json`, created readable by you only (`0600`), in a
+  directory set to `0700`. `RIL_SYNC_URL` and `RIL_SYNC_TOKEN` override both
+  when set, which is how to run without touching the config at all.
+
 ## Configuration
 
 Config file: `~/.config/ril/config.json`
@@ -203,9 +278,13 @@ Config file: `~/.config/ril/config.json`
 ```json
 {
   "data_folder": "/Users/you/ReadItLater",
-  "backup_folder": "/Users/you/Desktop"
+  "backup_folder": "/Users/you/Desktop",
+  "sync_url": "https://example.com/ril"
 }
 ```
 
 `backup_folder` is where `ril export` and `ril backup` write when no `--output`
 is given. You are asked for it the first time and it is remembered afterwards.
+
+`sync_url` is set by `ril sync login`. Only non-secret settings live here; the
+sync token is kept separately, in `~/.config/ril/credentials.json`.
