@@ -176,6 +176,31 @@ def needs_body(local: Optional[Article], remote: Article) -> bool:
     return local.body_sha256 != remote.body_sha256
 
 
+def verify_digests(data_folder: Path) -> int:
+    """Recompute every digest from the files on disk. Returns how many changed.
+
+    A digest is a claim about a file. If the two ever disagree — a body that
+    failed to arrive, a file removed by hand — neither side can tell, because
+    they compare claims and not files. This settles it from the files
+    themselves, and runs on a full reconciliation, which is the moment such a
+    disagreement can actually be repaired.
+    """
+    corrected = 0
+    with index_transaction(data_folder) as index:
+        for article in index.articles:
+            if article.deleted:
+                continue
+            try:
+                body = read_body(data_folder, article)
+            except (ValueError, OSError):
+                continue
+            actual = body_digest(body) if body.strip() else None
+            if article.body_sha256 != actual:
+                article.body_sha256 = actual
+                corrected += 1
+    return corrected
+
+
 def backfill_digests(data_folder: Path) -> int:
     """Record the digest of every body already on disk. Returns how many.
 
@@ -216,12 +241,21 @@ def _merge_records(index, incoming: list[Article]) -> tuple[set[str], set[str], 
         merged = merge_article(current, remote)
         mine[merged.id] = merged
         touched.add(merged.id)
+
         if merged.deleted:
             # A delete that arrives has to take the file with it, or the body
             # stays on disk forever and shows up as an orphan in a backup.
             merged.body_sha256 = None
             tombstoned.append(merged)
-        elif needs_body(current, merged):
+            continue
+
+        # The digest has to describe the body this side actually holds, not
+        # the one the merge would like it to hold. Adopting the other side's
+        # digest before its body arrives makes both sides agree that nothing
+        # needs sending, and the missing body is never noticed again.
+        held = None if current is None else current.body_sha256
+        merged.body_sha256 = held
+        if remote.body_sha256 and remote.body_sha256 != held:
             wanted.add(merged.id)
 
     index.articles = list(mine.values())
@@ -265,6 +299,11 @@ def apply_incoming(
     because the merge may not have decided in its favour and it needs the
     answer.
     """
+    # A full reconciliation is the one moment a digest that disagrees with the
+    # file behind it can be found and put right.
+    if since is None:
+        verify_digests(data_folder)
+
     now = utcnow()
     with index_transaction(data_folder) as index:
         send = {a.id for a in changed_since(index.articles, since)}
@@ -364,11 +403,15 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     exchange fails part way, the cursors are not moved, so the next sync
     simply covers the same ground again.
     """
-    # Must happen before anything is compared, or records whose digest is
-    # simply unknown look like records whose body is missing.
-    backfill_digests(data_folder)
-
     state = SyncState.load(data_folder)
+    if state.remote is None:
+        # A full exchange: check every digest against its file, so a body that
+        # went missing here is noticed rather than assumed present.
+        verify_digests(data_folder)
+    else:
+        # Must happen before anything is compared, or records whose digest is
+        # simply unknown look like records whose body is missing.
+        backfill_digests(data_folder)
     local_now = utcnow()
     index = load_index(data_folder)
     outgoing = changed_since(index.articles, state.local)
@@ -438,21 +481,38 @@ def _pull_bodies(data_folder: Path, client, wanted: set[str]) -> int:
     return written
 
 
+# How many bodies go in one request. Large enough that a first sync is a few
+# dozen round trips rather than thousands, small enough to keep each request
+# and the memory behind it modest.
+_BODY_BATCH = 50
+
+
 def _push_bodies(data_folder: Path, client, wanted: list[str]) -> int:
     if not wanted:
         return 0
-    index = load_index(data_folder)
-    by_id = index.by_id()
-    sent = 0
+    by_id = load_index(data_folder).by_id()
+
+    ready: dict[str, str] = {}
     for article_id in wanted:
         article = by_id.get(article_id)
         if article is None or article.deleted:
             continue
         markdown = read_body(data_folder, article)
-        if not markdown.strip():
-            continue  # nothing here worth sending
-        client.request("PUT", f"/api/sync/body/{article_id}", json={"markdown": markdown})
-        sent += 1
+        if markdown.strip():
+            ready[article_id] = markdown
+
+    items = list(ready.items())
+    sent = 0
+    for start in range(0, len(items), _BODY_BATCH):
+        batch = dict(items[start : start + _BODY_BATCH])
+        response = client.request("PUT", "/api/sync/bodies", json={"bodies": batch})
+        if response.status_code in (404, 405):
+            # A server from before batching. Fall back to one at a time.
+            for article_id, markdown in items[start:]:
+                client.request("PUT", f"/api/sync/body/{article_id}", json={"markdown": markdown})
+                sent += 1
+            return sent
+        sent += len(batch)
     return sent
 
 

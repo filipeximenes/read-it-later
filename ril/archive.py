@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Iterator, Optional
 
 from ril.models import Index
-from ril.storage import is_internal_file, load_index
+from ril.storage import SYNC_STATE_NAME, is_internal_file, load_index
 
 INDEX_NAME = "index.json"
 ARTICLES_DIR = "articles"
@@ -99,9 +99,7 @@ def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> byte
                 break
             out.extend(chunk)
             if len(out) > limit:
-                raise ArchiveError(
-                    f"Entry {info.filename} is larger than the {limit} byte limit."
-                )
+                raise ArchiveError(f"Entry {info.filename} is larger than the {limit} byte limit.")
     return bytes(out)
 
 
@@ -167,9 +165,7 @@ def inspect_archive(zip_path: Path, label: Optional[str] = None) -> ArchiveSumma
             )
 
         if INDEX_NAME not in members:
-            raise ArchiveError(
-                f"Archive has no {INDEX_NAME} — it is not a ril backup."
-            )
+            raise ArchiveError(f"Archive has no {INDEX_NAME} — it is not a ril backup.")
         try:
             raw = _read_member(zf, members[INDEX_NAME], _MAX_INDEX_BYTES).decode("utf-8")
             index = Index.model_validate_json(raw)
@@ -203,9 +199,7 @@ def inspect_archive(zip_path: Path, label: Optional[str] = None) -> ArchiveSumma
     summary.missing_files = sorted(
         a.filename for a in index.live if f"{ARTICLES_DIR}/{a.filename}" not in article_files
     )
-    summary.orphan_files = sorted(
-        Path(name).name for name in article_files if name not in indexed
-    )
+    summary.orphan_files = sorted(Path(name).name for name in article_files if name not in indexed)
     return summary
 
 
@@ -256,6 +250,7 @@ def restore_archive(
             raise ArchiveError(f"Archive is corrupt and was not restored: {exc}") from exc
 
         _swap_in(data_folder, incoming, staging / "previous")
+        _clear_sync_state(data_folder)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -276,6 +271,17 @@ def _write_snapshot(data_folder: Path) -> Path:
             f"Could not write a safety snapshot next to {data_folder} ({exc}). "
             "Free up space or pass --no-snapshot to skip it."
         ) from exc
+
+
+def _clear_sync_state(data_folder: Path) -> None:
+    """Forget where sync had got to.
+
+    The library has just been replaced wholesale, so a cursor from before the
+    restore describes data that is no longer here. Left in place, the next
+    sync would decide nothing had changed and send none of the restored
+    articles. Removing it makes that sync a full reconciliation.
+    """
+    (data_folder / SYNC_STATE_NAME).unlink(missing_ok=True)
 
 
 def _swap_in(data_folder: Path, incoming: Path, previous: Path) -> None:

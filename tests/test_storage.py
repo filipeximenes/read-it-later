@@ -244,3 +244,23 @@ def test_saving_records_the_body_digest(tmp_path):
     article = save_article(tmp_path, _extracted())
     assert article.body_sha256
     assert load_index(tmp_path).articles[0].body_sha256 == article.body_sha256
+
+
+def test_restoring_forgets_where_sync_had_got_to(tmp_path):
+    """A cursor from before a restore describes data that is no longer here.
+
+    Left in place, the next sync decides nothing changed and sends none of the
+    restored articles — which is exactly what happened once, by hand.
+    """
+    from ril.archive import create_archive, restore_archive
+    from ril.storage import SYNC_STATE_NAME
+
+    data = tmp_path / "data"
+    save_article(data, _extracted())
+    zip_path = tmp_path / "backup.zip"
+    create_archive(data, zip_path)
+
+    (data / SYNC_STATE_NAME).write_text('{"remote": "2026-01-01T00:00:00+00:00"}')
+    restore_archive(data, zip_path, make_snapshot=False)
+
+    assert not (data / SYNC_STATE_NAME).exists()

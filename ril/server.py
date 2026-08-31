@@ -65,6 +65,13 @@ class _SyncRequest(BaseModel):
 class _BodyRequest(BaseModel):
     markdown: str
 
+
+class _BodiesRequest(BaseModel):
+    """Several bodies at once, so one index write covers all of them."""
+
+    bodies: dict[str, str] = Field(default_factory=dict)
+
+
 _YT_WATCH_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?.*?v=([A-Za-z0-9_-]+)")
 _YT_SHORT_RE = re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]+)")
 _VIMEO_RE = re.compile(r"(?:https?://)?(?:www\.)?vimeo\.com/(\d+)")
@@ -1488,7 +1495,11 @@ def _bucket_activity(
             if lo <= br < hi:
                 read[count - 1 - (br - offset)] += 1
     return [
-        {"label": _bucket_label(count - 1 - i + offset, now, unit), "saved": saved[i], "read": read[i]}
+        {
+            "label": _bucket_label(count - 1 - i + offset, now, unit),
+            "saved": saved[i],
+            "read": read[i],
+        }
         for i in range(count)
     ]
 
@@ -1522,7 +1533,11 @@ def _compute_stats(index: Index) -> dict:
     )
     if durations:
         mid = len(durations) // 2
-        median_ttr = durations[mid] if len(durations) % 2 else round((durations[mid - 1] + durations[mid]) / 2)
+        median_ttr = (
+            durations[mid]
+            if len(durations) % 2
+            else round((durations[mid - 1] + durations[mid]) / 2)
+        )
     else:
         median_ttr = None
     oldest_unread = max(
@@ -1590,7 +1605,9 @@ def build_app(data_folder: Path) -> FastAPI:
             return [a.model_dump(mode="json") for a in tab_list]
 
         try:
-            file_basenames = await asyncio.to_thread(_matching_filenames_via_cli, data_folder, needle)
+            file_basenames = await asyncio.to_thread(
+                _matching_filenames_via_cli, data_folder, needle
+            )
         except _SearchUnavailableError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
 
@@ -1696,9 +1713,7 @@ def build_app(data_folder: Path) -> FastAPI:
     @app.post("/api/sync")
     async def sync_endpoint(body: _SyncRequest) -> dict:
         """Merge the other side's changes and hand back what it has not seen."""
-        outcome = await asyncio.to_thread(
-            apply_incoming, data_folder, body.articles, body.since
-        )
+        outcome = await asyncio.to_thread(apply_incoming, data_folder, body.articles, body.since)
         return {
             "now": outcome.now.isoformat(),
             "articles": [a.model_dump(mode="json") for a in outcome.outgoing],
@@ -1722,6 +1737,32 @@ def build_app(data_folder: Path) -> FastAPI:
         if not markdown.strip():
             raise HTTPException(status_code=404, detail="No body stored for this article")
         return {"markdown": markdown}
+
+    @app.put("/api/sync/bodies")
+    async def write_sync_bodies(body: _BodiesRequest) -> dict:
+        """Store many bodies under a single index write.
+
+        One transaction per body would re-serialise the whole index once per
+        article, which is quadratic in the size of the library — slow enough
+        on a first sync to look like a hang.
+        """
+
+        def _store() -> dict[str, str]:
+            written: dict[str, str] = {}
+            with index_transaction(data_folder) as index:
+                by_id = index.by_id()
+                for article_id, markdown in body.bodies.items():
+                    article = by_id.get(article_id)
+                    if article is None or article.deleted or not markdown.strip():
+                        continue
+                    write_body(data_folder, article, markdown)
+                    written[article_id] = article.body_sha256 or ""
+            return written
+
+        try:
+            return {"stored": await asyncio.to_thread(_store)}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.put("/api/sync/body/{article_id}")
     async def write_sync_body(article_id: str, body: _BodyRequest) -> dict:

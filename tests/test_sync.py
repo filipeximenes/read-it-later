@@ -590,3 +590,55 @@ def test_a_side_with_a_body_wins_a_tie_against_a_side_without_one():
 
     # And the empty side then knows to ask for it.
     assert needs_body(no_body, merge_article(has_body, no_body))
+
+
+def test_a_digest_is_never_adopted_before_its_body_arrives(tmp_path):
+    """Otherwise both sides agree nothing is missing, and it never is sent.
+
+    This happened for real: a body failed to arrive, but the receiving side
+    had already taken the sender's digest, so the two compared equal forever
+    and the gap could not be seen.
+    """
+    from ril.extractor import ExtractedArticle
+    from ril.storage import index_transaction, load_index, save_article
+    from ril.sync import merge_locally
+
+    folder = tmp_path / "here"
+    saved = save_article(
+        folder, ExtractedArticle(url="https://e.com/x", title="X", body_markdown="mine")
+    )
+    # This side has no body at all, as a receiver would not.
+    with index_transaction(folder) as index:
+        index.articles[0].body_sha256 = None
+
+    incoming = saved.model_copy(deep=True)
+    incoming.body_sha256 = "their-digest"
+    incoming.touch_content()
+
+    outcome = merge_locally(folder, [incoming])
+
+    stored = load_index(folder).by_id()[saved.id]
+    assert stored.body_sha256 is None, "took a digest for a body it does not have"
+    assert saved.id in outcome.wanted_bodies
+
+
+def test_verifying_digests_corrects_a_claim_the_file_does_not_support(tmp_path):
+    from ril.extractor import ExtractedArticle
+    from ril.storage import get_article_path, index_transaction, load_index, save_article
+    from ril.sync import verify_digests
+
+    folder = tmp_path / "here"
+    saved = save_article(
+        folder, ExtractedArticle(url="https://e.com/x", title="X", body_markdown="real body")
+    )
+    # The file loses its body while the index still claims one.
+    path = get_article_path(folder, saved)
+    path.write_text("---\nid: x\n---\n\n", encoding="utf-8")
+
+    assert verify_digests(folder) == 1
+    assert load_index(folder).by_id()[saved.id].body_sha256 is None
+
+    # And a library that already agrees with itself is left alone.
+    with index_transaction(folder):
+        pass
+    assert verify_digests(folder) == 0
