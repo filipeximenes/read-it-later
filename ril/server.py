@@ -1717,11 +1717,18 @@ def build_app(data_folder: Path) -> FastAPI:
             markdown = await asyncio.to_thread(read_body, data_folder, article)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        # No body here is a 404, never an empty one. An empty answer would look
+        # like a real body to the other side and overwrite the copy it has.
+        if not markdown.strip():
+            raise HTTPException(status_code=404, detail="No body stored for this article")
         return {"markdown": markdown}
 
     @app.put("/api/sync/body/{article_id}")
     async def write_sync_body(article_id: str, body: _BodyRequest) -> dict:
         """Take a body the other side fetched, for a record already merged."""
+
+        if not body.markdown.strip():
+            raise HTTPException(status_code=422, detail="Refusing to store an empty body")
 
         def _store() -> Optional[str]:
             with index_transaction(data_folder) as index:

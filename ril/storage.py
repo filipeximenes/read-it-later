@@ -238,12 +238,16 @@ _FRONT_MATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
 
 def read_body(data_folder: Path, article: Article) -> str:
-    """The markdown of an article, without its front matter."""
+    """The markdown of an article, without its front matter.
+
+    Empty when there is no file, or the file holds only front matter. Callers
+    must treat that as "there is no body here", never as a body worth sending.
+    """
     path = get_article_path(data_folder, article)
     if not path.exists():
         return ""
     raw = path.read_text(encoding="utf-8")
-    return _FRONT_MATTER_RE.sub("", raw, count=1).lstrip()
+    return _FRONT_MATTER_RE.sub("", raw, count=1).strip()
 
 
 def write_body(data_folder: Path, article: Article, body_markdown: str) -> None:
@@ -251,10 +255,18 @@ def write_body(data_folder: Path, article: Article, body_markdown: str) -> None:
 
     The front matter is rebuilt from the record rather than sent along with
     the body, so the file always agrees with the index.
+
+    An empty body is refused. Nothing legitimate produces one — even an
+    article that could not be fetched is saved with a note in it — so an empty
+    body means the other side had nothing, and writing it would destroy the
+    copy here. This is the last guard against that; callers are expected to
+    have dropped it already.
     """
+    body = body_markdown.strip()
+    if not body:
+        raise ValueError(f"Refusing to write an empty body for {article.id}")
     path = get_article_path(data_folder, article)
     path.parent.mkdir(parents=True, exist_ok=True)
-    body = body_markdown.strip()
     path.write_text(_front_matter(article) + "\n\n" + body + "\n", encoding="utf-8")
     article.body_sha256 = body_digest(body)
 

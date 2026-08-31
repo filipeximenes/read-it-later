@@ -426,3 +426,167 @@ def test_a_dry_run_changes_nothing(tmp_path):
     report = sync_once(folder, client=None, dry_run=True)
     assert report.dry_run
     assert SyncState.load(folder).local is None
+
+
+# --- never lose a body ------------------------------------------------------
+#
+# A real library was emptied by an early version of this code. Every test here
+# stands for one of the mistakes that combined to do it.
+
+
+def _library_with_bodies(folder, count=3):
+    from ril.extractor import ExtractedArticle
+    from ril.storage import save_article
+
+    saved = []
+    for i in range(count):
+        saved.append(
+            save_article(
+                folder,
+                ExtractedArticle(
+                    url=f"https://e.com/{i}", title=f"T{i}", body_markdown=f"Real body {i}" * 20
+                ),
+            )
+        )
+    return saved
+
+
+def _client_answering(handler):
+    import httpx
+
+    from ril.remote import Remote, RemoteClient
+
+    client = RemoteClient(Remote(url="https://e.com/ril", token="t"))
+    client._client = httpx.Client(
+        transport=httpx.MockTransport(handler), headers=dict(client._client.headers)
+    )
+    return client
+
+
+def test_syncing_with_a_server_that_has_no_bodies_keeps_ours(tmp_path):
+    """The exact failure that emptied a real library.
+
+    The server had every record but not one body. This side had every body but
+    no digests, because they predate sync. Each record therefore looked like
+    one whose body was missing here, the server was asked for all of them, and
+    its empty answers were written over the real files.
+    """
+    import httpx
+
+    from ril.storage import load_index, read_body
+    from ril.sync import sync_once
+
+    folder = tmp_path / "laptop"
+    saved = _library_with_bodies(folder)
+    before = {a.id: read_body(folder, a) for a in saved}
+    assert all(before.values())
+
+    # Digests are cleared, exactly as a library migrated from version 1.
+    from ril.storage import index_transaction
+
+    with index_transaction(folder) as index:
+        for article in index.articles:
+            article.body_sha256 = None
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/sync"):
+            # It knows the records, and has no body for any of them.
+            articles = [a.model_dump(mode="json") for a in load_index(folder).articles]
+            for a in articles:
+                a["body_sha256"] = None
+            return httpx.Response(
+                200,
+                json={
+                    "now": T0.isoformat(),
+                    "articles": articles,
+                    "want_bodies": [a["id"] for a in articles],
+                },
+            )
+        if request.method == "GET":
+            # What the server really did: a 200 with nothing in it, because
+            # reading a file it did not have returned an empty string.
+            return httpx.Response(200, json={"markdown": ""})
+        return httpx.Response(200, json={"body_sha256": "x"})
+
+    sync_once(folder, _client_answering(server))
+
+    after = {a.id: read_body(folder, load_index(folder).by_id()[a.id]) for a in saved}
+    assert after == before, "sync destroyed local article bodies"
+
+
+def test_an_empty_answer_is_never_written_over_a_body(tmp_path):
+    """Even if a server answers 200 with nothing, the file here survives."""
+    import httpx
+
+    from ril.storage import index_transaction, load_index, read_body
+    from ril.sync import sync_once
+
+    folder = tmp_path / "laptop"
+    saved = _library_with_bodies(folder, 1)[0]
+    before = read_body(folder, saved)
+
+    with index_transaction(folder) as index:
+        index.articles[0].body_sha256 = None
+
+    def server(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/sync"):
+            article = load_index(folder).articles[0].model_dump(mode="json")
+            article["body_sha256"] = "something-else"
+            return httpx.Response(
+                200,
+                json={"now": T0.isoformat(), "articles": [article], "want_bodies": []},
+            )
+        return httpx.Response(200, json={"markdown": "   \n  "})
+
+    sync_once(folder, _client_answering(server))
+    assert read_body(folder, load_index(folder).by_id()[saved.id]) == before
+
+
+def test_storage_refuses_to_write_an_empty_body(tmp_path):
+    """The last guard, in case a caller ever stops filtering."""
+    from ril.storage import write_body
+
+    folder = tmp_path / "laptop"
+    saved = _library_with_bodies(folder, 1)[0]
+    with pytest.raises(ValueError, match="empty body"):
+        write_body(folder, saved, "   \n ")
+
+
+def test_digests_are_filled_in_from_the_files_on_disk(tmp_path):
+    from ril.storage import index_transaction, load_index
+    from ril.sync import backfill_digests
+
+    folder = tmp_path / "laptop"
+    _library_with_bodies(folder, 3)
+    with index_transaction(folder) as index:
+        for article in index.articles:
+            article.body_sha256 = None
+
+    assert backfill_digests(folder) == 3
+    assert all(a.body_sha256 for a in load_index(folder).articles)
+    # Repeating it does nothing, because there is nothing left to fill.
+    assert backfill_digests(folder) == 0
+
+
+def test_a_body_is_not_asked_for_when_the_other_side_has_none():
+    remote = _article(body_sha256=None)
+    assert not needs_body(None, remote)
+    assert not needs_body(_article(body_sha256="aaa"), remote)
+
+
+def test_a_side_with_a_body_wins_a_tie_against_a_side_without_one():
+    """Recovery depends on this.
+
+    After restoring from a backup, both sides hold the same record with the
+    same clocks, but only one still has the body. If the empty side won, the
+    merged record would say there is no body, and neither side would ever ask
+    for one.
+    """
+    has_body = _article(body_sha256="aaa")
+    no_body = _article(body_sha256=None)
+
+    for merged in (merge_article(has_body, no_body), merge_article(no_body, has_body)):
+        assert merged.body_sha256 == "aaa"
+
+    # And the empty side then knows to ask for it.
+    assert needs_body(no_body, merge_article(has_body, no_body))

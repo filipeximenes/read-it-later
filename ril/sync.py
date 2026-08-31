@@ -30,6 +30,7 @@ from ril.models import Article, as_utc, utcnow
 from ril.remote import RemoteProtocolError
 from ril.storage import (
     SYNC_STATE_NAME,
+    body_digest,
     get_article_path,
     index_transaction,
     load_index,
@@ -81,6 +82,11 @@ def _content_rank(article: Article) -> tuple:
     return (
         not article.fetch_failed,
         article.content_updated_at,
+        # At equal times, a side that actually holds a body beats one that
+        # holds none. Without this the two could tie on an arbitrary digest,
+        # and a side with no body could win — after which neither side would
+        # ask for one, because their digests would agree at "nothing".
+        article.body_sha256 is not None,
         _fingerprint(tuple(getattr(article, name) for name in _CONTENT_FIELDS)),
     )
 
@@ -156,12 +162,40 @@ def changed_since(articles: list[Article], moment: Optional[datetime]) -> list[A
 
 
 def needs_body(local: Optional[Article], remote: Article) -> bool:
-    """Whether the remote body has to be fetched to bring this side up to date."""
-    if remote.deleted:
+    """Whether the remote body has to be fetched to bring this side up to date.
+
+    An unknown digest on the remote side is not a reason to ask for it: the
+    other side is saying it has no body, and asking would get nothing back.
+    A library from before sync existed has no digests either, which is why
+    `backfill_digests` runs first and fills them in from the files on disk.
+    """
+    if remote.deleted or remote.body_sha256 is None:
         return False
     if local is None or local.body_sha256 is None:
         return True
     return local.body_sha256 != remote.body_sha256
+
+
+def backfill_digests(data_folder: Path) -> int:
+    """Record the digest of every body already on disk. Returns how many.
+
+    A library saved before sync existed has no digests. Left unset, every one
+    of its records looks like one whose body is missing here, and the other
+    side gets asked for bodies this side already holds.
+    """
+    filled = 0
+    with index_transaction(data_folder) as index:
+        for article in index.articles:
+            if article.deleted or article.body_sha256 is not None:
+                continue
+            try:
+                body = read_body(data_folder, article)
+            except (ValueError, OSError):
+                continue
+            if body:
+                article.body_sha256 = body_digest(body)
+                filled += 1
+    return filled
 
 
 def _merge_records(index, incoming: list[Article]) -> tuple[set[str], set[str], list[Article]]:
@@ -330,6 +364,10 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     exchange fails part way, the cursors are not moved, so the next sync
     simply covers the same ground again.
     """
+    # Must happen before anything is compared, or records whose digest is
+    # simply unknown look like records whose body is missing.
+    backfill_digests(data_folder)
+
     state = SyncState.load(data_folder)
     local_now = utcnow()
     index = load_index(data_folder)
@@ -347,9 +385,7 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     # would look like a successful, quiet sync and move the cursor past
     # changes that were never sent.
     if response.status_code in (404, 405):
-        raise RemoteProtocolError(
-            "That server has no sync endpoints yet. Update the hosted copy."
-        )
+        raise RemoteProtocolError("That server has no sync endpoints yet. Update the hosted copy.")
     if response.status_code >= 400:
         raise RemoteProtocolError(f"The sync endpoint answered {response.status_code}.")
     try:
@@ -360,8 +396,10 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     outcome = merge_locally(data_folder, incoming)
     report = SyncReport(sent=len(outgoing), received=len(incoming))
 
-    report.bodies_received = _pull_bodies(data_folder, client, outcome.wanted_bodies)
+    # Send before receiving. If anything goes wrong in between, the other side
+    # has gained a body rather than this side having lost one.
     report.bodies_sent = _push_bodies(data_folder, client, answer.get("want_bodies", []))
+    report.bodies_received = _pull_bodies(data_folder, client, outcome.wanted_bodies)
 
     # Only now, once everything has landed, does the sync count as done.
     SyncState(remote=_read_moment(answer.get("now")) or local_now, local=local_now).save(
@@ -378,17 +416,26 @@ def _pull_bodies(data_folder: Path, client, wanted: set[str]) -> int:
         response = client.request("GET", f"/api/sync/body/{article_id}")
         if response.status_code == 404:
             continue
-        fetched[article_id] = response.json().get("markdown", "")
+        markdown = response.json().get("markdown", "") if response.status_code < 300 else ""
+        # An empty answer is never an improvement on what is here. It means the
+        # other side has no file, and writing it would destroy this one.
+        if markdown.strip():
+            fetched[article_id] = markdown
 
     if not fetched:
         return 0
+    written = 0
     with index_transaction(data_folder) as index:
         by_id = index.by_id()
         for article_id, markdown in fetched.items():
             article = by_id.get(article_id)
-            if article is not None and not article.deleted:
-                write_body(data_folder, article, markdown)
-    return len(fetched)
+            if article is None or article.deleted:
+                continue
+            if article.body_sha256 == body_digest(markdown.strip()):
+                continue  # already exactly this
+            write_body(data_folder, article, markdown)
+            written += 1
+    return written
 
 
 def _push_bodies(data_folder: Path, client, wanted: list[str]) -> int:
@@ -402,8 +449,8 @@ def _push_bodies(data_folder: Path, client, wanted: list[str]) -> int:
         if article is None or article.deleted:
             continue
         markdown = read_body(data_folder, article)
-        if not markdown:
-            continue
+        if not markdown.strip():
+            continue  # nothing here worth sending
         client.request("PUT", f"/api/sync/body/{article_id}", json={"markdown": markdown})
         sent += 1
     return sent
