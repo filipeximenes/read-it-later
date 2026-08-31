@@ -72,6 +72,10 @@ class _BodiesRequest(BaseModel):
     bodies: dict[str, str] = Field(default_factory=dict)
 
 
+class _BodiesWanted(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+
+
 _YT_WATCH_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?.*?v=([A-Za-z0-9_-]+)")
 _YT_SHORT_RE = re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]+)")
 _VIMEO_RE = re.compile(r"(?:https?://)?(?:www\.)?vimeo\.com/(\d+)")
@@ -1737,6 +1741,32 @@ def build_app(data_folder: Path) -> FastAPI:
         if not markdown.strip():
             raise HTTPException(status_code=404, detail="No body stored for this article")
         return {"markdown": markdown}
+
+    @app.post("/api/sync/bodies")
+    async def read_sync_bodies(body: _BodiesWanted) -> dict:
+        """Several bodies at once, so a first pull is not a round trip each.
+
+        Only bodies that exist are returned. A missing one is simply absent
+        from the answer, never an empty string, which the other side would
+        have no way to tell from a real body.
+        """
+
+        def _read() -> dict[str, str]:
+            by_id = load_index(data_folder).by_id()
+            found: dict[str, str] = {}
+            for article_id in body.ids:
+                article = by_id.get(article_id)
+                if article is None or article.deleted:
+                    continue
+                try:
+                    markdown = read_body(data_folder, article)
+                except ValueError:
+                    continue
+                if markdown.strip():
+                    found[article_id] = markdown
+            return found
+
+        return {"bodies": await asyncio.to_thread(_read)}
 
     @app.put("/api/sync/bodies")
     async def write_sync_bodies(body: _BodiesRequest) -> dict:

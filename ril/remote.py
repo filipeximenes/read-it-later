@@ -35,7 +35,9 @@ _TOKEN_KEY = "sync_token"
 # reaches a network. Everywhere else a bearer token needs TLS.
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
-_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+# Generous on reads: a hosted instance that sleeps when idle can take most of
+# a minute to wake, and that first request should not look like a failure.
+_TIMEOUT = httpx.Timeout(90.0, connect=15.0)
 
 
 class RemoteError(RuntimeError):

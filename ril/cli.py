@@ -50,7 +50,7 @@ from ril.storage import (
     save_article,
     update_article,
 )
-from ril.sync import sync_is_stale, sync_once
+from ril.sync import sync_is_stale, sync_once, sync_preview
 
 app = typer.Typer(
     name="ril",
@@ -647,14 +647,17 @@ def sync_run(
 ):
     """Exchange changes with the hosted copy."""
     data_folder = _data_folder()
+    if dry_run:
+        console.print(
+            f"[dim]Would send {sync_preview(data_folder)} record(s). Nothing was changed.[/dim]"
+        )
+        return
+
     with _remote_failure_exits():
         remote = load_remote()
         with RemoteClient(remote) as client:
-            report = sync_once(data_folder, client, dry_run=dry_run)
+            report = sync_once(data_folder, client)
 
-    if report.dry_run:
-        console.print(f"[dim]Would send {report.sent} record(s). Nothing was changed.[/dim]")
-        return
     if report.quiet:
         console.print("[dim]Already up to date.[/dim]")
         return

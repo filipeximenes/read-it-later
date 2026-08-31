@@ -1,31 +1,21 @@
-"""Merging two copies of the library.
+"""Carrying changes between this library and a hosted copy of it.
 
-Both sides run these rules, unchanged, on the same pair of records. That is
-what makes sync safe without a coordinator: it does not matter which side
-syncs first, in what order changes arrive, or how long one side was offline.
-Given the same two records, both ends reach the same answer.
-
-Two properties are relied on and tested:
-
-- **Commutative.** `merge(a, b)` equals `merge(b, a)`. If it were not, the two
-  sides would disagree and each would keep pushing its own version forever.
-- **Idempotent.** Merging a result again changes nothing, so a retried or
-  duplicated sync is harmless.
-
-A record is not merged as a whole. It is three parts that change
-independently and therefore settle independently: whether it still exists, its
-body and metadata, and whether it has been read.
+Deciding what wins is `ril.merge`, a pure function of two records. This module
+is everything around that: applying a merge to a library on disk, moving
+bodies, remembering where the last exchange left off, and driving one round of
+it against a server.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import batched
 from pathlib import Path
 from typing import Optional
 
+from ril.merge import changed_since, merge_article, needs_body
 from ril.models import Article, as_utc, utcnow
 from ril.remote import RemoteProtocolError
 from ril.storage import (
@@ -40,140 +30,6 @@ from ril.storage import (
 
 # Bumped if the wire format changes in a way an older client cannot read.
 SYNC_PROTOCOL = 1
-
-# Fields that travel together as "the article's content". The body lives in a
-# file, so `body_sha256` and `filename` are how a record points at it.
-_CONTENT_FIELDS = (
-    "url",
-    "title",
-    "author",
-    "description",
-    "published_date",
-    "tags",
-    "image_urls",
-    "video_urls",
-    "fetch_failed",
-    "filename",
-    "body_sha256",
-    "content_updated_at",
-)
-
-
-def _fingerprint(values: tuple) -> str:
-    """A stable digest of some fields, used only to break an exact tie.
-
-    Both sides must break a tie the same way, or they would each keep choosing
-    their own version and never agree. Ranking on a digest of the fields
-    themselves does that, and makes a tie mean what it should: the two records
-    are identical in everything being compared, so either will do.
-    """
-    return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()
-
-
-def _content_rank(article: Article) -> tuple:
-    """How good this side's content is. Higher wins.
-
-    A body that was actually fetched beats a paywall stub however recent the
-    stub is. This is the rule that makes the whole arrangement work: the
-    command line runs where the browser cookies are, so its copy of a
-    paywalled article is the real one, and it must not be overwritten by the
-    server's later, emptier attempt.
-    """
-    return (
-        not article.fetch_failed,
-        article.content_updated_at,
-        # At equal times, a side that actually holds a body beats one that
-        # holds none. Without this the two could tie on an arbitrary digest,
-        # and a side with no body could win — after which neither side would
-        # ask for one, because their digests would agree at "nothing".
-        article.body_sha256 is not None,
-        _fingerprint(tuple(getattr(article, name) for name in _CONTENT_FIELDS)),
-    )
-
-
-def _state_rank(article: Article) -> tuple:
-    """Whether this side's read state is the newer one. Higher wins."""
-    return (
-        article.state_updated_at,
-        _fingerprint((article.read, article.read_at)),
-    )
-
-
-def _existence_rank(article: Article) -> tuple:
-    """Whether this side's view of the article existing is the newer one.
-
-    Deletion is not permanent: saving a URL again clears the tombstone and
-    moves this clock, so a later re-add beats an earlier delete. Only an exact
-    tie falls back to deleting, and that needs two machines to have acted in
-    the same microsecond.
-    """
-    return (article.existence_updated_at, article.deleted)
-
-
-def _better(left: Article, right: Article, rank) -> Article:
-    return left if rank(left) >= rank(right) else right
-
-
-def merge_article(mine: Optional[Article], theirs: Optional[Article]) -> Article:
-    """The one record both sides should end up holding.
-
-    Either side may be absent, which is simply "this side has not seen it".
-    """
-    if mine is None and theirs is None:
-        raise ValueError("merge_article needs at least one record")
-    if mine is None:
-        return theirs.model_copy(deep=True)
-    if theirs is None:
-        return mine.model_copy(deep=True)
-    if mine.id != theirs.id:
-        raise ValueError(f"Cannot merge different articles: {mine.id} and {theirs.id}")
-
-    content = _better(mine, theirs, _content_rank)
-    state = _better(mine, theirs, _state_rank)
-    existence = _better(mine, theirs, _existence_rank)
-
-    merged = content.model_copy(deep=True)
-    for field in ("read", "read_at", "state_updated_at"):
-        setattr(merged, field, getattr(state, field))
-    merged.deleted = existence.deleted
-    merged.existence_updated_at = existence.existence_updated_at
-    # The article was saved when it was first saved anywhere.
-    merged.saved_at = min(mine.saved_at, theirs.saved_at)
-    return merged
-
-
-def merge_indexes(mine: dict[str, Article], theirs: dict[str, Article]) -> dict[str, Article]:
-    """Merge two id-keyed sets of records, including tombstones."""
-    return {
-        article_id: merge_article(mine.get(article_id), theirs.get(article_id))
-        for article_id in mine.keys() | theirs.keys()
-    }
-
-
-def changed_since(articles: list[Article], moment: Optional[datetime]) -> list[Article]:
-    """Records touched since `moment`. Everything, when that is None."""
-    if moment is None:
-        return list(articles)
-    return [
-        a
-        for a in articles
-        if max(a.content_updated_at, a.state_updated_at, a.existence_updated_at) > moment
-    ]
-
-
-def needs_body(local: Optional[Article], remote: Article) -> bool:
-    """Whether the remote body has to be fetched to bring this side up to date.
-
-    An unknown digest on the remote side is not a reason to ask for it: the
-    other side is saying it has no body, and asking would get nothing back.
-    A library from before sync existed has no digests either, which is why
-    `backfill_digests` runs first and fills them in from the files on disk.
-    """
-    if remote.deleted or remote.body_sha256 is None:
-        return False
-    if local is None or local.body_sha256 is None:
-        return True
-    return local.body_sha256 != remote.body_sha256
 
 
 def verify_digests(data_folder: Path) -> int:
@@ -199,28 +55,6 @@ def verify_digests(data_folder: Path) -> int:
                 article.body_sha256 = actual
                 corrected += 1
     return corrected
-
-
-def backfill_digests(data_folder: Path) -> int:
-    """Record the digest of every body already on disk. Returns how many.
-
-    A library saved before sync existed has no digests. Left unset, every one
-    of its records looks like one whose body is missing here, and the other
-    side gets asked for bodies this side already holds.
-    """
-    filled = 0
-    with index_transaction(data_folder) as index:
-        for article in index.articles:
-            if article.deleted or article.body_sha256 is not None:
-                continue
-            try:
-                body = read_body(data_folder, article)
-            except (ValueError, OSError):
-                continue
-            if body:
-                article.body_sha256 = body_digest(body)
-                filled += 1
-    return filled
 
 
 def _merge_records(index, incoming: list[Article]) -> tuple[set[str], set[str], list[Article]]:
@@ -253,9 +87,8 @@ def _merge_records(index, incoming: list[Article]) -> tuple[set[str], set[str], 
         # the one the merge would like it to hold. Adopting the other side's
         # digest before its body arrives makes both sides agree that nothing
         # needs sending, and the missing body is never noticed again.
-        held = None if current is None else current.body_sha256
-        merged.body_sha256 = held
-        if remote.body_sha256 and remote.body_sha256 != held:
+        merged.body_sha256 = None if current is None else current.body_sha256
+        if needs_body(current, remote):
             wanted.add(merged.id)
 
     index.articles = list(mine.values())
@@ -386,17 +219,24 @@ class SyncReport:
     received: int = 0
     bodies_sent: int = 0
     bodies_received: int = 0
-    repaired: int = 0
-    dry_run: bool = False
 
     @property
     def quiet(self) -> bool:
-        return not any(
-            (self.sent, self.received, self.bodies_sent, self.bodies_received, self.repaired)
-        )
+        return not any((self.sent, self.received, self.bodies_sent, self.bodies_received))
 
 
-def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
+def sync_preview(data_folder: Path) -> int:
+    """How many records the next sync would send. Reads only.
+
+    Deliberately not a mode of `sync_once`: that one settles digests against
+    the files before it compares anything, which is a write, and a preview
+    that writes is not a preview.
+    """
+    state = SyncState.load(data_folder)
+    return len(changed_since(load_index(data_folder).articles, state.local))
+
+
+def sync_once(data_folder: Path, client) -> SyncReport:
     """One full exchange with the hosted copy.
 
     Nothing here has to succeed for the library to stay correct. If the
@@ -406,18 +246,11 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     state = SyncState.load(data_folder)
     if state.remote is None:
         # A full exchange: check every digest against its file, so a body that
-        # went missing here is noticed rather than assumed present.
+        # went missing here — or a library older than sync, which has no
+        # digests at all — is settled from the files rather than assumed.
         verify_digests(data_folder)
-    else:
-        # Must happen before anything is compared, or records whose digest is
-        # simply unknown look like records whose body is missing.
-        backfill_digests(data_folder)
     local_now = utcnow()
-    index = load_index(data_folder)
-    outgoing = changed_since(index.articles, state.local)
-
-    if dry_run:
-        return SyncReport(sent=len(outgoing), dry_run=True)
+    outgoing = changed_since(load_index(data_folder).articles, state.local)
 
     payload = {
         "since": state.remote.isoformat() if state.remote else None,
@@ -451,20 +284,54 @@ def sync_once(data_folder: Path, client, dry_run: bool = False) -> SyncReport:
     return report
 
 
+# How many bodies go in one request. Large enough that a first sync is a few
+# dozen round trips rather than thousands, small enough to keep each request
+# and the memory behind it modest.
+_BODY_BATCH = 50
+
+
 def _pull_bodies(data_folder: Path, client, wanted: set[str]) -> int:
+    """Fetch the bodies this side is missing and write them. Returns how many."""
     if not wanted:
         return 0
-    fetched: dict[str, str] = {}
-    for article_id in sorted(wanted):
-        response = client.request("GET", f"/api/sync/body/{article_id}")
-        if response.status_code == 404:
-            continue
-        markdown = response.json().get("markdown", "") if response.status_code < 300 else ""
-        # An empty answer is never an improvement on what is here. It means the
-        # other side has no file, and writing it would destroy this one.
-        if markdown.strip():
-            fetched[article_id] = markdown
 
+    remaining = sorted(wanted)
+    fetched: dict[str, str] = {}
+    # Counts what was asked for, not what came back: a body the other side does
+    # not have is simply absent from its answer, so the two differ.
+    asked = 0
+    for batch in batched(remaining, _BODY_BATCH):
+        response = client.request("POST", "/api/sync/bodies", json={"ids": list(batch)})
+        if response.status_code in (404, 405):
+            # A server from before batching. Ask for the rest one at a time.
+            fetched.update(_pull_one_at_a_time(client, remaining[asked:]))
+            break
+        fetched.update(_usable(response.json().get("bodies") or {}))
+        asked += len(batch)
+
+    return _store_bodies(data_folder, fetched)
+
+
+def _pull_one_at_a_time(client, article_ids: list[str]) -> dict[str, str]:
+    found: dict[str, str] = {}
+    for article_id in article_ids:
+        response = client.request("GET", f"/api/sync/body/{article_id}")
+        if response.status_code >= 300:
+            continue
+        found.update(_usable({article_id: response.json().get("markdown", "")}))
+    return found
+
+
+def _usable(bodies: dict[str, str]) -> dict[str, str]:
+    """Drop anything empty.
+
+    An empty answer is never an improvement on what is here: it means the
+    other side has no file, and writing it would destroy this one.
+    """
+    return {k: v for k, v in bodies.items() if v.strip()}
+
+
+def _store_bodies(data_folder: Path, fetched: dict[str, str]) -> int:
     if not fetched:
         return 0
     written = 0
@@ -481,13 +348,8 @@ def _pull_bodies(data_folder: Path, client, wanted: set[str]) -> int:
     return written
 
 
-# How many bodies go in one request. Large enough that a first sync is a few
-# dozen round trips rather than thousands, small enough to keep each request
-# and the memory behind it modest.
-_BODY_BATCH = 50
-
-
 def _push_bodies(data_folder: Path, client, wanted: list[str]) -> int:
+    """Send the bodies the other side is missing. Returns how many."""
     if not wanted:
         return 0
     by_id = load_index(data_folder).by_id()
@@ -497,18 +359,15 @@ def _push_bodies(data_folder: Path, client, wanted: list[str]) -> int:
         article = by_id.get(article_id)
         if article is None or article.deleted:
             continue
-        markdown = read_body(data_folder, article)
-        if markdown.strip():
-            ready[article_id] = markdown
+        ready.update(_usable({article_id: read_body(data_folder, article)}))
 
     items = list(ready.items())
     sent = 0
-    for start in range(0, len(items), _BODY_BATCH):
-        batch = dict(items[start : start + _BODY_BATCH])
-        response = client.request("PUT", "/api/sync/bodies", json={"bodies": batch})
+    for batch in batched(items, _BODY_BATCH):
+        response = client.request("PUT", "/api/sync/bodies", json={"bodies": dict(batch)})
         if response.status_code in (404, 405):
-            # A server from before batching. Fall back to one at a time.
-            for article_id, markdown in items[start:]:
+            # A server from before batching. Send the rest one at a time.
+            for article_id, markdown in items[sent:]:
                 client.request("PUT", f"/api/sync/body/{article_id}", json={"markdown": markdown})
                 sent += 1
             return sent
