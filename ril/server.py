@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -93,15 +93,33 @@ _YT_WATCH_RE = re.compile(r"(?:https?://)?(?:www\.)?youtube\.com/watch\?.*?v=([A
 _YT_SHORT_RE = re.compile(r"(?:https?://)?(?:www\.)?youtu\.be/([A-Za-z0-9_-]+)")
 _VIMEO_RE = re.compile(r"(?:https?://)?(?:www\.)?vimeo\.com/(\d+)")
 
-# The reader page is a real HTML file, `ril/web/index.html`. It is read
-# through the package so an installed wheel finds it the same way a checkout
-# does, and cached because it never changes while the server runs.
-_PAGE = resources.files("ril").joinpath("web/index.html")
+# The reader is a folder of real files, `ril/web/`: one HTML page, its
+# stylesheets and its ES modules. They are read through the package so an
+# installed wheel finds them the same way a checkout does, and cached because
+# none of them changes while the server runs.
+_WEB = resources.files("ril").joinpath("web")
+
+# An asset name is one plain filename with a known extension. Nothing else is
+# served, so no request can reach outside the folder whatever it spells.
+_ASSET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\.(css|js)$")
+_ASSET_TYPES = {"css": "text/css; charset=utf-8", "js": "text/javascript; charset=utf-8"}
 
 
 @lru_cache(maxsize=1)
 def _reader_page() -> str:
-    return _PAGE.read_text(encoding="utf-8")
+    return _WEB.joinpath("index.html").read_text(encoding="utf-8")
+
+
+@lru_cache(maxsize=64)
+def _asset(name: str) -> Optional[tuple[str, str]]:
+    """The text and content type of one static asset, or None if there is none."""
+    match = _ASSET_NAME_RE.fullmatch(name)
+    if match is None:
+        return None
+    resource = _WEB.joinpath(name)
+    if not resource.is_file():
+        return None
+    return resource.read_text(encoding="utf-8"), _ASSET_TYPES[match.group(1)]
 
 
 def _strip_front_matter(content: str) -> str:
@@ -345,6 +363,16 @@ def build_app(data_folder: Path) -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         return HTMLResponse(_reader_page())
+
+    @app.get("/static/{name}")
+    async def static_asset(name: str) -> Response:
+        asset = _asset(name)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        content, media_type = asset
+        # The process holds the file for its whole life, so let the browser
+        # ask again rather than serve what an edit and a restart replaced.
+        return Response(content, media_type=media_type, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/articles")
     async def list_articles(filter: str = "unread", q: Optional[str] = None) -> list[dict]:

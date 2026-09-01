@@ -108,6 +108,30 @@ ril open ed6348d6
 
 Uses `$EDITOR`. Pass `--no-mark` to open without marking as read.
 
+### Read in a browser
+
+```bash
+ril serve                 # http://localhost:8484, and opens a browser
+ril serve --port 8931
+ril serve --no-browser
+```
+
+On a phone the reader takes the whole screen: the header and the action dock
+step aside as you read down the page and come back the moment you scroll up, a
+thin bar along the top shows how far in you are, and the article picks up where
+you left it when you come back to it. **Mark as read** is always within reach at
+the bottom — never a scroll away — and at the end of an article it becomes
+**Mark as read & next**, followed by a card for whatever comes after it.
+
+**Aa** opens the reading settings: theme (auto, light, sepia, dark), text size,
+sans or serif, line spacing and line width. They are remembered in the browser
+and applied before the page paints, so nothing flashes.
+
+On a screen wide enough, the list and the article sit side by side.
+
+Keyboard: `/` search, `a` add a URL, `j` / `k` next and previous article,
+`m` mark as read, `+` / `-` text size, `Esc` back to the list.
+
 ### Mark an article as read or unread
 
 ```bash

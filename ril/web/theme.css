@@ -1,0 +1,141 @@
+/* Design tokens and the four colour schemes.
+   Light is the base; the other schemes only restate the tokens that change.
+   `data-theme` is absent for "auto", so the media query decides on its own. */
+
+:root {
+  color-scheme: light;
+
+  --bg: #ffffff;
+  --surface: #f7f8fa;
+  --surface-2: #eceef2;
+  --border: #e3e6ec;
+  --border-strong: #cdd3dd;
+
+  --text: #14171c;
+  --text-dim: #5b6472;
+  --text-faint: #8b94a2;
+
+  --accent: #3457d5;
+  --accent-hover: #2743b4;
+  --accent-soft: rgba(52, 87, 213, 0.10);
+  --on-accent: #ffffff;
+
+  --green: #10794f;
+  --green-soft: rgba(16, 121, 79, 0.12);
+  --red: #c0362c;
+  --red-soft: rgba(192, 54, 44, 0.10);
+  --amber: #9a6700;
+
+  --shadow-sheet: 0 -10px 40px rgba(15, 20, 30, 0.16);
+  --shadow-pop: 0 14px 36px rgba(15, 20, 30, 0.18);
+
+  /* Reading typography — the settings sheet writes these on <html>. */
+  --reader-size: 18px;
+  --reader-leading: 1.7;
+  --reader-measure: 40rem;
+  --reader-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  --ui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono-font: ui-monospace, "SF Mono", "Fira Code", Consolas, monospace;
+
+  --sidebar-w: 340px;
+  --safe-l: env(safe-area-inset-left, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: env(safe-area-inset-top, 0px);
+}
+
+/* --- dark ------------------------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    color-scheme: dark;
+
+    --bg: #0f1117;
+    --surface: #161923;
+    --surface-2: #1f2331;
+    --border: #2a3040;
+    --border-strong: #3b4256;
+
+    --text: #e6e9ef;
+    --text-dim: #98a1b2;
+    --text-faint: #6b7488;
+
+    --accent: #7d99ff;
+    --accent-hover: #98aeff;
+    --accent-soft: rgba(125, 153, 255, 0.14);
+    --on-accent: #0f1117;
+
+    --green: #43d39e;
+    --green-soft: rgba(67, 211, 158, 0.14);
+    --red: #f8867e;
+    --red-soft: rgba(248, 134, 126, 0.13);
+    --amber: #fbbf24;
+
+    --shadow-sheet: 0 -10px 40px rgba(0, 0, 0, 0.55);
+    --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.55);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0f1117;
+  --surface: #161923;
+  --surface-2: #1f2331;
+  --border: #2a3040;
+  --border-strong: #3b4256;
+
+  --text: #e6e9ef;
+  --text-dim: #98a1b2;
+  --text-faint: #6b7488;
+
+  --accent: #7d99ff;
+  --accent-hover: #98aeff;
+  --accent-soft: rgba(125, 153, 255, 0.14);
+  --on-accent: #0f1117;
+
+  --green: #43d39e;
+  --green-soft: rgba(67, 211, 158, 0.14);
+  --red: #f8867e;
+  --red-soft: rgba(248, 134, 126, 0.13);
+  --amber: #fbbf24;
+
+  --shadow-sheet: 0 -10px 40px rgba(0, 0, 0, 0.55);
+  --shadow-pop: 0 14px 36px rgba(0, 0, 0, 0.55);
+}
+
+/* --- sepia ------------------------------------------------------------ */
+:root[data-theme="sepia"] {
+  color-scheme: light;
+
+  --bg: #f6efe0;
+  --surface: #f0e7d4;
+  --surface-2: #e7dcc4;
+  --border: #ddd1b6;
+  --border-strong: #c7b795;
+
+  --text: #383024;
+  --text-dim: #6b6053;
+  --text-faint: #8d8172;
+
+  --accent: #9a5522;
+  --accent-hover: #7d4318;
+  --accent-soft: rgba(154, 85, 34, 0.12);
+  --on-accent: #fdf8ee;
+
+  --green: #4d7a34;
+  --green-soft: rgba(77, 122, 52, 0.14);
+  --red: #a8392a;
+  --red-soft: rgba(168, 57, 42, 0.12);
+  --amber: #8a6407;
+
+  --shadow-sheet: 0 -10px 40px rgba(78, 60, 32, 0.18);
+  --shadow-pop: 0 14px 36px rgba(78, 60, 32, 0.20);
+}
+
+/* --- explicit light --------------------------------------------------- */
+/* Same values as the base block; named so an explicit choice of Light wins
+   over the OS preference, which only applies while `data-theme` is absent. */
+:root[data-theme="light"] {
+  color-scheme: light;
+}

@@ -14,6 +14,17 @@ This overrides the real config and keeps all test operations isolated.
 Never run `ril` commands without this prefix unless the user explicitly asks
 you to operate on their real data.
 
+**`RIL_DATA_FOLDER` does not isolate sync.** The sync URL and token live in
+`~/.config/ril`, so any command that syncs — `ril serve` (one quiet sync at
+startup), `add`, `delete`, `mark`, `sync run` — still talks to the user's real
+hosted copy, and will push whatever is in the temporary folder up to it and
+pull the real library down into it. To run the server against throwaway data,
+skip the CLI and start the app directly:
+
+```bash
+python -m uvicorn --host 127.0.0.1 --port 8931 mydemo:app   # mydemo.py: app = build_app(Path("/tmp/ril-dev"))
+```
+
 ## Installing latest version
 
 After making code changes, reinstall the tool with:
@@ -37,7 +48,7 @@ fail with "Operation not permitted".
 | `ril/archive.py` | Backup zips: `create_archive`, `inspect_archive`, `restore_archive` |
 | `ril/cli.py` | Typer CLI commands: `add`, `list`, `open`, `mark`, `delete`, `refresh`, `export`, `import pocket`, `import backup`, `serve` (plus `backup`, a hidden deprecated alias of `export`) |
 | `ril/server.py` | FastAPI web server; serves the reader page and the JSON API |
-| `ril/web/index.html` | The whole single-page reader: HTML, CSS and vanilla JS in one file |
+| `ril/web/` | The reader front end: `index.html` plus three stylesheets and eight ES modules (see below) |
 
 ## Markdown file format
 
@@ -74,20 +85,50 @@ is configured — the hosted copy serves this same page and has nowhere to sync
 to. `POST /api/sync/run` requires an `X-RIL-Sync: run` header, the same trick
 the import endpoint uses to keep a cross-origin page out.
 
-The entire frontend (HTML, CSS, vanilla JS, marked.js CDN) lives in
-`ril/web/index.html`, one file with nothing generated into it — all UI changes must
-be made there. `server.py` reads it through `importlib.resources`, so an installed
-wheel finds it exactly as a checkout does, and caches it for the life of the
-process: after editing the page, restart `ril serve`.
+## The front end (`ril/web/`)
 
-It is a data file, not a module, so it only reaches a wheel because
-`[tool.setuptools.package-data]` in `pyproject.toml` names it. Anything else added
-under `ril/web/` has to be named there too.
+Plain files, no build step, no framework: hand-written HTML, CSS and ES modules,
+plus marked.js from a CDN (with a plain-text fallback in `reader.js` for when the
+CDN cannot be reached).
+
+| File | Role |
+|------|------|
+| `index.html` | All the markup, and one inline script that replays the saved reading preferences before the first paint |
+| `theme.css` | Design tokens and the four colour schemes (auto / light / sepia / dark) |
+| `app.css` | Shell, library pane, menus, sheets, toast, statistics |
+| `reader.css` | The reading screen: chrome, prose, dock, settings sheet |
+| `ui.js` | `$`, escaping, formatting, and the shared menu / overlay / toast helpers |
+| `api.js` | Every call to the server; failures arrive as `ApiError` with a message fit to show |
+| `store.js` | The shared state and a small event bus, so no two screens import each other |
+| `prefs.js` | Reading preferences — the only place that knows what a preference means in CSS |
+| `library.js` | Tabs, search, the list, saving a URL |
+| `reader.js` | The reading screen: content, actions, chrome, progress, scroll memory |
+| `stats.js` | The statistics sheet and the activity chart |
+| `transfer.js` | Sync, export, import |
+| `main.js` | One delegated `data-action` handler, the keyboard shortcuts, start-up |
+
+Behaviour is wired by `data-action` attributes handled in `main.js`, never by
+inline `onclick` — a module's functions are not global. Screens are shown and
+hidden with the `hidden` property (`show()` in `ui.js`), which `[hidden]
+{ display: none !important }` in `app.css` makes stick.
+
+`server.py` reads these through `importlib.resources`, so an installed wheel finds
+them exactly as a checkout does, and **caches each one for the life of the
+process: after editing anything under `ril/web/`, restart the server.**
+`GET /static/{name}` serves them, and only names matching
+`^[a-z0-9][a-z0-9_-]*\.(css|js)$` that exist in the folder — nothing else is
+reachable, whatever a request spells.
+
+They are data files, not modules, so they only reach a wheel because
+`[tool.setuptools.package-data]` in `pyproject.toml` names their extensions. A new
+kind of file under `ril/web/` has to be named there, and in `_ASSET_TYPES`, too.
 
 The CSS is **mobile-first**: the base rules describe the single-column phone layout
-(the sidebar and the reader share the screen and swap via `body.reading`), and the
-single `@media (min-width: 860px)` block at the end adds the two-pane desktop
-layout. Put new rules in the base block and only override in the media query.
+(the library and the reader are two full screens that swap via `body.reading`, each
+with its own header — the filter tabs can never appear over an article), and the
+single `@media (min-width: 860px)` block at the end of each stylesheet adds the
+two-pane desktop layout. Put new rules in the base block and only override in the
+media query.
 
 ## Destructive operations
 

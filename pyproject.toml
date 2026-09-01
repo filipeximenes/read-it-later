@@ -33,10 +33,10 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["ril*"]
 
-# The reader page is a data file, not a module, so it has to be named here or
+# The reader's files are data, not modules, so they have to be named here or
 # `ril serve` would find nothing to serve from an installed wheel.
 [tool.setuptools.package-data]
-ril = ["web/*.html"]
+ril = ["web/*.html", "web/*.css", "web/*.js"]
 
 [tool.ruff]
 line-length = 100
