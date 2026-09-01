@@ -23,6 +23,12 @@ from ril.archive import (
 )
 from ril.extractor import fetch_and_extract
 from ril.models import Article, Index
+from ril.remote import (
+    Remote,
+    RemoteClient,
+    RemoteError,
+    load_remote,
+)
 from ril.storage import (
     delete_article,
     get_article_path,
@@ -34,13 +40,18 @@ from ril.storage import (
     update_article,
     write_body,
 )
-from ril.sync import SYNC_PROTOCOL, apply_incoming
+from ril.sync import SYNC_PROTOCOL, SyncReport, apply_incoming, sync_once
 
 # Import replaces the whole library, so it is guarded by a header a cross-origin
 # page cannot send without a CORS preflight that this app never grants.
 _IMPORT_CONFIRM_HEADER = "x-ril-confirm"
 _IMPORT_CONFIRM_VALUE = "replace-all"
 _MAX_IMPORT_BYTES = 2 * 1024 * 1024 * 1024
+
+# Starting a sync writes to this library and reaches out to the hosted copy, so
+# the button that does it is guarded the same way import is.
+_SYNC_RUN_HEADER = "x-ril-sync"
+_SYNC_RUN_VALUE = "run"
 
 _FRONT_MATTER_RE = re.compile(r"^---\s*\n.*?\n---\s*\n?", re.DOTALL)
 
@@ -163,6 +174,13 @@ _HTML = """<!DOCTYPE html>
   }
   .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
   .btn-label { display: none; }
+
+  /* Sync: hidden unless this instance has a hosted copy to sync with.
+     .icon-btn sets display, so [hidden] has to say so again to win. */
+  #sync-btn[hidden] { display: none; }
+  #sync-btn.busy { border-color: var(--accent); color: var(--accent); }
+  #sync-btn.busy .sync-mark { animation: spin 0.9s linear infinite; }
+  .sync-mark { display: inline-block; }
 
   #back-btn { display: none; }
   body.reading #back-btn { display: flex; }
@@ -560,6 +578,7 @@ _HTML = """<!DOCTYPE html>
       <span class="brand">ril</span>
     </div>
     <div class="nav-actions">
+      <button id="sync-btn" class="icon-btn" onclick="runSync()" aria-label="Sync now" hidden><span class="sync-mark">↻</span><span class="btn-label">Sync</span></button>
       <button id="add-btn" class="icon-btn" onclick="openAddUrl()" aria-label="Add URL">+<span class="btn-label">Add URL</span></button>
       <div id="menu-wrap">
         <button id="menu-btn" class="icon-btn" onclick="toggleMenu(event)" aria-label="More actions" aria-haspopup="true" aria-expanded="false">⋯</button>
@@ -1069,6 +1088,47 @@ function maybeCloseOverlay(e, id) {
   }
 }
 
+// --- sync -------------------------------------------------------------
+
+let syncing = false;
+
+async function loadSyncConfig() {
+  // The hosted copy serves this same page and has nowhere to sync to, so the
+  // button stays hidden unless the server says it has a remote.
+  try {
+    const res = await fetch('/api/sync/config');
+    if (!res.ok) return;
+    const data = await res.json();
+    document.getElementById('sync-btn').hidden = !data.enabled;
+  } catch (e) { /* sync is optional; leave the button hidden */ }
+}
+
+async function runSync() {
+  if (syncing) return;
+  syncing = true;
+  const btn = document.getElementById('sync-btn');
+  btn.classList.add('busy');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/sync/run', {
+      method: 'POST',
+      headers: { 'X-RIL-Sync': 'run' },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.detail || 'Sync failed.');
+      return;
+    }
+    btn.title = `Synced — sent ${data.sent}, received ${data.received}`;
+    await loadArticles();
+    loadStats();
+  } finally {
+    syncing = false;
+    btn.classList.remove('busy');
+    btn.disabled = false;
+  }
+}
+
 function toggleMenu(e) {
   e.stopPropagation();
   const menu = document.getElementById('menu');
@@ -1362,6 +1422,7 @@ document.addEventListener('keydown', e => {
 history.replaceState({ articleId: null }, '');
 loadArticles();
 loadStats();
+loadSyncConfig();
 </script>
 </body>
 </html>"""
@@ -1592,6 +1653,16 @@ async def _spool_upload(request: Request, destination: Path) -> int:
     return written
 
 
+def _sync_with_remote(data_folder: Path, remote: Remote) -> SyncReport:
+    """One exchange with the hosted copy, driven from inside the web server.
+
+    The same client the command line uses, so a sync started from the page and
+    one started from a terminal do exactly the same thing.
+    """
+    with RemoteClient(remote) as client:
+        return sync_once(data_folder, client)
+
+
 def build_app(data_folder: Path) -> FastAPI:
     app = FastAPI(title="Read It Later", docs_url=None, redoc_url=None)
 
@@ -1816,6 +1887,51 @@ def build_app(data_folder: Path) -> FastAPI:
         if digest is None:
             raise HTTPException(status_code=404, detail="Article not found")
         return {"body_sha256": digest}
+
+    # -- syncing outward, on behalf of the page -----------------------------
+
+    # One at a time. Two overlapping exchanges would race each other on the
+    # index and on the cursors, and the second would carry nothing new.
+    sync_running = asyncio.Lock()
+
+    @app.get("/api/sync/config")
+    async def sync_config() -> dict:
+        """Whether this instance has a hosted copy to sync with.
+
+        The page asks before it shows a sync button, because the hosted copy
+        runs this same app and has nowhere of its own to sync to. Only the
+        answer to that question is returned — never the URL or the token.
+        """
+        try:
+            load_remote()
+        except RemoteError:
+            return {"enabled": False}
+        return {"enabled": True}
+
+    @app.post("/api/sync/run")
+    async def run_sync(request: Request) -> dict:
+        """Exchange with the hosted copy now, at the reader's request."""
+        if request.headers.get(_SYNC_RUN_HEADER) != _SYNC_RUN_VALUE:
+            raise HTTPException(status_code=403, detail="Sync must be started from this page.")
+        try:
+            remote = load_remote()
+        except RemoteError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if sync_running.locked():
+            raise HTTPException(status_code=409, detail="A sync is already running.")
+        async with sync_running:
+            try:
+                report = await asyncio.to_thread(_sync_with_remote, data_folder, remote)
+            except RemoteError as exc:
+                # The library is untouched or partly caught up, and the cursors
+                # did not move, so the next sync covers the same ground again.
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "sent": report.sent,
+            "received": report.received,
+            "bodies_sent": report.bodies_sent,
+            "bodies_received": report.bodies_received,
+        }
 
     @app.get("/api/export")
     async def export_archive() -> FileResponse:

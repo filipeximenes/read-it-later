@@ -564,6 +564,12 @@ def serve(
     from ril.server import build_app
 
     data_folder = _data_folder()
+
+    # Pull before the first page is served, so the reader opens on what the
+    # hosted copy already knows rather than on a stale list. Quiet, like every
+    # other automatic sync: a server that is asleep must not stop `serve`.
+    _sync_quietly(data_folder)
+
     fastapi_app = build_app(data_folder)
 
     if not no_browser:

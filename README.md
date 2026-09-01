@@ -218,7 +218,12 @@ ril sync logout         # forget the token
 `add`, `mark`, `delete` and `refresh` sync once when they finish. One exchange
 carries both directions, so that single call pushes what you just did and pulls
 whatever the hosted copy has. `list` syncs first, but only if the last one was
-over five minutes ago.
+over five minutes ago. `serve` syncs once before it starts listening, so the
+reader opens on a current list.
+
+While the reader is open, a **Sync** button in its top bar runs the same
+exchange and reloads the list. The button only appears when this instance has a
+hosted copy to sync with, so the hosted copy's own page does not show one.
 
 **Sync never makes a command fail.** The article is already saved by the time
 it runs, so a server that is asleep, slow or unreachable prints one dim line

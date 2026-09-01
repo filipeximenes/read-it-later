@@ -66,6 +66,13 @@ client = TestClient(build_app(Path("/tmp/ril-dev")))
 response = client.get("/api/articles?filter=unread")
 ```
 
+`serve` runs one quiet sync before it starts uvicorn, and the page offers a Sync
+button that calls `POST /api/sync/run`. Both are no-ops when sync is not set up.
+The page asks `GET /api/sync/config` first and hides the button unless a remote
+is configured — the hosted copy serves this same page and has nowhere to sync
+to. `POST /api/sync/run` requires an `X-RIL-Sync: run` header, the same trick
+the import endpoint uses to keep a cross-origin page out.
+
 The entire frontend (HTML, CSS, vanilla JS, marked.js CDN) is a single string constant
 `_HTML` inside `ril/server.py`. There are no separate static files — all UI changes
 must be made there.

@@ -37,7 +37,11 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # Generous on reads: a hosted instance that sleeps when idle can take most of
 # a minute to wake, and that first request should not look like a failure.
-_TIMEOUT = httpx.Timeout(90.0, connect=15.0)
+# A batch of bodies then asks it to write fifty files before it answers, and a
+# full reconciliation asks for the whole library at once, so the read budget is
+# minutes rather than seconds. Nothing is lost by waiting — a sync that times
+# out early only means the same work again on the next one.
+_TIMEOUT = httpx.Timeout(300.0, connect=30.0)
 
 
 class RemoteError(RuntimeError):
