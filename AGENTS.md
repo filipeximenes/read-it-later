@@ -36,7 +36,8 @@ fail with "Operation not permitted".
 | `ril/extractor.py` | Fetch and parse articles from URLs (`fetch_and_extract`) |
 | `ril/archive.py` | Backup zips: `create_archive`, `inspect_archive`, `restore_archive` |
 | `ril/cli.py` | Typer CLI commands: `add`, `list`, `open`, `mark`, `delete`, `refresh`, `export`, `import pocket`, `import backup`, `serve` (plus `backup`, a hidden deprecated alias of `export`) |
-| `ril/server.py` | FastAPI web server + embedded single-page app (HTML/CSS/JS as a string constant) |
+| `ril/server.py` | FastAPI web server; serves the reader page and the JSON API |
+| `ril/web/index.html` | The whole single-page reader: HTML, CSS and vanilla JS in one file |
 
 ## Markdown file format
 
@@ -73,12 +74,15 @@ is configured — the hosted copy serves this same page and has nowhere to sync
 to. `POST /api/sync/run` requires an `X-RIL-Sync: run` header, the same trick
 the import endpoint uses to keep a cross-origin page out.
 
-The entire frontend (HTML, CSS, vanilla JS, marked.js CDN) is a single string constant
-`_HTML` inside `ril/server.py`. There are no separate static files — all UI changes
-must be made there.
+The entire frontend (HTML, CSS, vanilla JS, marked.js CDN) lives in
+`ril/web/index.html`, one file with nothing generated into it — all UI changes must
+be made there. `server.py` reads it through `importlib.resources`, so an installed
+wheel finds it exactly as a checkout does, and caches it for the life of the
+process: after editing the page, restart `ril serve`.
 
-Note that `_HTML` is a plain (non-raw) `"""` string, so any backslash in the JS —
-a regexp like `\\s` — must be doubled in the Python source.
+It is a data file, not a module, so it only reaches a wheel because
+`[tool.setuptools.package-data]` in `pyproject.toml` names it. Anything else added
+under `ril/web/` has to be named there too.
 
 The CSS is **mobile-first**: the base rules describe the single-column phone layout
 (the sidebar and the reader share the screen and swap via `body.reading`), and the

@@ -568,7 +568,10 @@ def serve(
     # Pull before the first page is served, so the reader opens on what the
     # hosted copy already knows rather than on a stale list. Quiet, like every
     # other automatic sync: a server that is asleep must not stop `serve`.
-    _sync_quietly(data_folder)
+    # Shown as a spinner, because a hosted copy that has to wake up first can
+    # make this the slowest part of starting.
+    with console.status("[bold cyan]Syncing…[/bold cyan]"):
+        _sync_quietly(data_folder)
 
     fastapi_app = build_app(data_folder)
 

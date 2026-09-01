@@ -26,14 +26,21 @@ dev = [
     "ruff>=0.15.13",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ril*"]
+
+# The reader page is a data file, not a module, so it has to be named here or
+# `ril serve` would find nothing to serve from an installed wheel.
+[tool.setuptools.package-data]
+ril = ["web/*.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
-
-[tool.ruff.lint.per-file-ignores]
-# The whole web UI is one embedded HTML/CSS/JS string constant, where a
-# line-length limit means nothing.
-"ril/server.py" = ["E501"]
